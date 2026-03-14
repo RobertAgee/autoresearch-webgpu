@@ -10,8 +10,9 @@
 	import {
 		getDb, insertExperiment, insertInference, insertLossCurve, getAllExperiments,
 		getBestExperiment, getInferencesForExperiment, getAllLossCurves, clearAllData,
-		exportExperimentsJson, updateWeightsPath, type ExperimentRow, type InferenceRow
+		exportCsvZip, updateWeightsPath, rowToConfig, type ExperimentRow, type InferenceRow
 	} from '$lib/db';
+	import { estimateParams } from '$lib/model/config';
 	import { saveWeights, loadWeights } from '$lib/weights';
 	import LossChart from '$lib/components/LossChart.svelte';
 	import ConfigEditor from '$lib/components/ConfigEditor.svelte';
@@ -78,7 +79,7 @@
 		}));
 		const best = await getBestExperiment();
 		if (best) {
-			config = best.config as ExperimentConfig;
+			config = rowToConfig(best);
 		}
 	}
 
@@ -87,7 +88,7 @@
 			id: row.id,
 			name: row.name,
 			source: row.source,
-			config: row.config as ExperimentConfig,
+			config: rowToConfig(row),
 			valBpb: row.val_bpb,
 			elapsed: row.elapsed,
 			totalSteps: row.total_steps,
@@ -175,7 +176,7 @@
 
 		const best = await getBestExperiment();
 		if (best) {
-			controller.bestConfig = best.config as ExperimentConfig;
+			controller.bestConfig = rowToConfig(best);
 			controller.bestBpb = best.val_bpb;
 			controller.history = [...experiments];
 		}
@@ -216,6 +217,7 @@
 	}
 
 	function selectExperiment(exp: ExperimentRecord) {
+		config = { ...exp.config };
 		selectExperimentById(exp.id);
 	}
 
@@ -249,8 +251,15 @@
 		sampling = false;
 	}
 
+	let showClearModal = $state(false);
+	let maxParams = $state(200_000_000);
+
 	async function handleClear() {
-		if (!confirm('Clear all experiment history?')) return;
+		showClearModal = true;
+	}
+
+	async function confirmClear() {
+		showClearModal = false;
 		await clearAllData();
 		experiments = [];
 		config = { ...DEFAULT_CONFIG };
@@ -260,18 +269,47 @@
 	}
 
 	async function handleExport() {
-		const json = await exportExperimentsJson();
-		const blob = new Blob([json], { type: 'application/json' });
+		const blob = await exportCsvZip();
 		const url = URL.createObjectURL(blob);
 		const a = document.createElement('a');
 		a.href = url;
-		a.download = 'autoresearch-experiments.json';
+		a.download = 'autoresearch-experiments.zip';
 		a.click();
 		URL.revokeObjectURL(url);
 	}
 
+	let paramCount = $derived(estimateParams(config));
+	let paramCapExceeded = $derived(paramCount > maxParams);
+
 	let currentInference = $derived(inferences.length > 0 ? inferences[inferenceIdx] : null);
 	let selectedExp = $derived(selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null);
+
+	/** Config diff: changes from the previous experiment to the selected one. */
+	let configDiff = $derived(() => {
+		if (!selectedExp) return [];
+		const idx = experiments.findIndex(e => e.id === selectedExp!.id);
+		if (idx <= 0) return [];
+		const prev = experiments[idx - 1].config;
+		const curr = selectedExp!.config;
+		const diffs: { key: string; from: string | number; to: string | number }[] = [];
+		for (const key of Object.keys(curr) as (keyof ExperimentConfig)[]) {
+			if (prev[key] !== curr[key]) {
+				diffs.push({ key, from: prev[key] as string | number, to: curr[key] as string | number });
+			}
+		}
+		return diffs;
+	});
+	/** True when viewing an old experiment's config (inputs should be locked). */
+	let viewingExisting = $derived(!!selectedExpId && !running);
+
+	function forkFromSelected() {
+		if (!selectedExp) return;
+		const baseName = selectedExp.name;
+		experimentName = `${baseName} (fork)`;
+		experimentDesc = '';
+		// config is already set from selectExperiment — just unlock
+		selectedExpId = null;
+	}
 </script>
 
 <svelte:head>
@@ -286,6 +324,12 @@
 			{gpuStatus.reason}
 		</div>
 	{:else}
+		<div>
+			<h1 class="text-lg font-mono text-gray-200">autoresearch-webgpu</h1>
+			<p class="text-xs font-mono text-gray-500">
+				Based on Andrej Karpathy's <a href="https://github.com/karpathy/autoresearch" class="underline hover:text-gray-300">autoresearch</a> and built on Eric Zhang's <a href="https://github.com/ekzhang/jax-js" class="underline hover:text-gray-300">jax-js</a>. Built by <a href="https://lucasgelfond.com" class="underline hover:text-gray-300">Lucas Gelfond</a>, in New York, with love.
+			</p>
+		</div>
 		<div class="flex items-center gap-4">
 			<div class="flex rounded border border-gray-700 text-sm font-mono overflow-hidden">
 				<button
@@ -300,7 +344,7 @@
 					onclick={() => (mode = 'research')}
 					disabled={running}
 				>
-					research
+					auto
 				</button>
 			</div>
 			<span class="text-gray-500 text-xs font-mono">
@@ -321,31 +365,46 @@
 			<div class="space-y-4">
 				<div class="rounded border border-gray-800 p-4">
 					<h2 class="text-sm font-mono text-gray-400 mb-3">config</h2>
-					<ConfigEditor bind:config disabled={running} />
+					<ConfigEditor bind:config disabled={running || viewingExisting} />
 				</div>
 
+				{#if paramCapExceeded}
+					<div class="rounded border border-yellow-800 bg-yellow-950/50 px-3 py-2 font-mono text-xs text-yellow-400">
+						{(paramCount / 1e6).toFixed(1)}M params exceeds {(maxParams / 1e6).toFixed(0)}M cap
+					</div>
+				{/if}
+
 				{#if mode === 'manual'}
-					<input
-						type="text"
-						bind:value={experimentName}
-						placeholder="experiment name..."
-						disabled={running}
-						class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 font-mono text-sm text-gray-200 placeholder-gray-500 disabled:opacity-40"
-					/>
-					<textarea
-						bind:value={experimentDesc}
-						placeholder="description / hypothesis..."
-						disabled={running}
-						rows={2}
-						class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40 resize-none"
-					></textarea>
-					<button
-						onclick={startManualTraining}
-						disabled={running || status === 'loading data...'}
-						class="w-full rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-4 py-2 font-mono text-sm transition-colors"
-					>
-						{running ? 'training...' : 'start training'}
-					</button>
+					{#if viewingExisting && selectedExp}
+						<button
+							onclick={forkFromSelected}
+							class="w-full rounded bg-gray-700 hover:bg-gray-600 px-4 py-2 font-mono text-sm text-gray-200 transition-colors"
+						>
+							create new config from existing
+						</button>
+					{:else}
+						<input
+							type="text"
+							bind:value={experimentName}
+							placeholder="experiment name..."
+							disabled={running}
+							class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 font-mono text-sm text-gray-200 placeholder-gray-500 disabled:opacity-40"
+						/>
+						<textarea
+							bind:value={experimentDesc}
+							placeholder="description / hypothesis..."
+							disabled={running}
+							rows={2}
+							class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40 resize-none"
+						></textarea>
+						<button
+							onclick={startManualTraining}
+							disabled={running || status === 'loading data...' || paramCapExceeded}
+							class="w-full rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-4 py-2 font-mono text-sm transition-colors"
+						>
+							{running ? 'training...' : 'start training'}
+						</button>
+					{/if}
 				{:else}
 					{#if !running}
 						<button
@@ -377,8 +436,14 @@
 							<span class="text-gray-200">{selectedExp.name}</span>
 							<span class="text-gray-500 tabular-nums ml-auto">{selectedExp.valBpb.toFixed(4)} bpb</span>
 						</div>
-						{#if selectedExp.reasoning && selectedExp.reasoning !== selectedExp.name}
-							<p class="text-xs text-gray-400 font-mono">{selectedExp.reasoning}</p>
+						{#if configDiff().length > 0}
+							<div class="flex flex-wrap gap-x-3 gap-y-1 font-mono text-xs">
+								{#each configDiff() as d}
+									<span class="text-gray-500">
+										{d.key}: <span class="text-gray-600">{d.from}</span> → <span class="text-yellow-400">{d.to}</span>
+									</span>
+								{/each}
+							</div>
 						{/if}
 					{:else}
 						<h2 class="text-sm font-mono text-gray-400">loss</h2>
@@ -387,12 +452,9 @@
 						<LossChart data={lossData} pastRuns={pastLossRuns} />
 					</div>
 
-					<div class="font-mono text-sm text-gray-300">
-						{status}
-					</div>
-
-					<!-- Inference inline -->
+					<!-- Inference -->
 					<div class="border-t border-gray-800 pt-3 space-y-2">
+						<h2 class="text-sm font-mono text-gray-400">inference</h2>
 						<div class="flex items-center gap-2">
 							<input
 								type="text"
@@ -449,7 +511,7 @@
 					</div>
 				</div>
 
-				{#if mode === 'research' && experiments.length > 0}
+				{#if experiments.length > 0}
 					<div class="rounded border border-gray-800 p-4">
 						<h2 class="text-sm font-mono text-gray-400 mb-2">research log</h2>
 						<ResearchLog {experiments} bestConfig={config} />
@@ -462,6 +524,25 @@
 				<div class="rounded border border-gray-800 p-4">
 					<h2 class="text-sm font-mono text-gray-400 mb-3">leaderboard</h2>
 					<Leaderboard {experiments} onSelect={selectExperiment} selected={selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null} />
+				</div>
+			</div>
+		</div>
+	{/if}
+
+	{#if showClearModal}
+		<div class="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+			<div class="bg-gray-900 border border-gray-700 rounded-lg p-6 max-w-sm space-y-4 font-mono">
+				<h3 class="text-sm text-gray-200">clear all data?</h3>
+				<p class="text-xs text-gray-400">this will delete all experiments, loss curves, inferences, and saved weights. this cannot be undone.</p>
+				<div class="flex gap-2 justify-end">
+					<button
+						onclick={() => (showClearModal = false)}
+						class="px-3 py-1.5 rounded bg-gray-800 text-gray-300 hover:bg-gray-700 text-sm"
+					>cancel</button>
+					<button
+						onclick={confirmClear}
+						class="px-3 py-1.5 rounded bg-red-600 text-white hover:bg-red-500 text-sm"
+					>clear everything</button>
 				</div>
 			</div>
 		</div>

@@ -1,0 +1,17 @@
+{
+	"nLayer": 3,
+	"nEmbd": 96,
+	"nHead": 4,
+	"mlpRatio": 4,
+	"activation": "relu_sq",
+	"useRoPE": true,
+	"softcapValue": 15,
+	"lr": 0.001,
+	"weightDecay": 0.1,
+	"warmupRatio": 0.1,
+	"cooldownRatio": 0.3,
+	"batchSize": 8,
+	"seqLen": 128,
+	"trainSeconds": 30,
+	"vocabSize": 256
+}

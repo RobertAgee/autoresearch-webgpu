@@ -8,6 +8,23 @@
 
 	const COLORS = ['#6b7280', '#4b5563', '#374151', '#9ca3af', '#6b7280'];
 
+	/** Pick nice round tick values for an axis range. */
+	function niceSteps(min: number, max: number, maxTicks: number): number[] {
+		const range = max - min;
+		if (range <= 0) return [min];
+		const rough = range / maxTicks;
+		const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+		const residual = rough / mag;
+		const nice = residual <= 1.5 ? 1 : residual <= 3 ? 2 : residual <= 7 ? 5 : 10;
+		const step = nice * mag;
+		const start = Math.ceil(min / step) * step;
+		const ticks: number[] = [];
+		for (let v = start; v <= max + step * 0.01; v += step) {
+			ticks.push(v);
+		}
+		return ticks;
+	}
+
 	$effect(() => {
 		if (!canvas) return;
 
@@ -16,16 +33,6 @@
 			...(data.length >= 2 ? [{ data, color: '#3b82f6', label: 'current' }] : [])
 		];
 
-		if (allSeries.length === 0 || allSeries.every(s => s.data.length < 2)) {
-			const ctx = canvas.getContext('2d')!;
-			const dpr = window.devicePixelRatio || 1;
-			canvas.width = canvas.clientWidth * dpr;
-			canvas.height = canvas.clientHeight * dpr;
-			ctx.scale(dpr, dpr);
-			ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
-			return;
-		}
-
 		const ctx = canvas.getContext('2d')!;
 		const dpr = window.devicePixelRatio || 1;
 		const w = canvas.clientWidth;
@@ -33,8 +40,13 @@
 		canvas.width = w * dpr;
 		canvas.height = h * dpr;
 		ctx.scale(dpr, dpr);
+		ctx.clearRect(0, 0, w, h);
 
-		const pad = { top: 10, right: 10, bottom: 30, left: 50 };
+		if (allSeries.length === 0 || allSeries.every(s => s.data.length < 2)) {
+			return;
+		}
+
+		const pad = { top: 12, right: 12, bottom: 32, left: 52 };
 		const plotW = w - pad.left - pad.right;
 		const plotH = h - pad.top - pad.bottom;
 
@@ -52,11 +64,45 @@
 		const minLoss = Math.min(...allLosses);
 		const maxLoss = Math.max(...allLosses);
 		const lossRange = maxLoss - minLoss || 1;
+		const stepRange = maxStep - minStep || 1;
 
-		const xScale = (step: number) => pad.left + ((step - minStep) / (maxStep - minStep || 1)) * plotW;
+		const xScale = (step: number) => pad.left + ((step - minStep) / stepRange) * plotW;
 		const yScale = (loss: number) => pad.top + (1 - (loss - minLoss) / lossRange) * plotH;
 
-		ctx.clearRect(0, 0, w, h);
+		// Gridlines
+		ctx.textAlign = 'right';
+		ctx.textBaseline = 'middle';
+		ctx.font = '10px monospace';
+
+		const yTicks = niceSteps(minLoss, maxLoss, 5);
+		for (const v of yTicks) {
+			const y = yScale(v);
+			if (y < pad.top - 1 || y > h - pad.bottom + 1) continue;
+			ctx.strokeStyle = '#1f2937';
+			ctx.lineWidth = 1;
+			ctx.beginPath();
+			ctx.moveTo(pad.left, y);
+			ctx.lineTo(w - pad.right, y);
+			ctx.stroke();
+			ctx.fillStyle = '#6b7280';
+			ctx.fillText(v.toFixed(2), pad.left - 6, y);
+		}
+
+		const xTicks = niceSteps(minStep, maxStep, 5);
+		ctx.textAlign = 'center';
+		ctx.textBaseline = 'top';
+		for (const v of xTicks) {
+			const x = xScale(v);
+			if (x < pad.left - 1 || x > w - pad.right + 1) continue;
+			ctx.strokeStyle = '#1f2937';
+			ctx.lineWidth = 1;
+			ctx.beginPath();
+			ctx.moveTo(x, pad.top);
+			ctx.lineTo(x, h - pad.bottom);
+			ctx.stroke();
+			ctx.fillStyle = '#6b7280';
+			ctx.fillText(v % 1 === 0 ? String(v) : v.toFixed(1), x, h - pad.bottom + 6);
+		}
 
 		// Axes
 		ctx.strokeStyle = '#374151';
@@ -67,16 +113,10 @@
 		ctx.lineTo(w - pad.right, h - pad.bottom);
 		ctx.stroke();
 
-		// Axis labels
-		ctx.fillStyle = '#9ca3af';
-		ctx.font = '10px monospace';
+		// Axis label
+		ctx.fillStyle = '#6b7280';
 		ctx.textAlign = 'center';
-		ctx.fillText(`${maxStep}`, w - pad.right, h - pad.bottom + 15);
-		ctx.fillText('step', pad.left + plotW / 2, h - 5);
-
-		ctx.textAlign = 'right';
-		ctx.fillText(maxLoss.toFixed(2), pad.left - 5, pad.top + 10);
-		ctx.fillText(minLoss.toFixed(2), pad.left - 5, h - pad.bottom);
+		ctx.fillText('step', pad.left + plotW / 2, h - 3);
 
 		// Draw non-highlighted series first, then highlighted on top
 		const sorted = [...allSeries].sort((a, b) => (a.highlight ? 1 : 0) - (b.highlight ? 1 : 0));
