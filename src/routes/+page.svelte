@@ -1,40 +1,37 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { initWebGPU, type WebGPUStatus } from '$lib/webgpu';
-	import { DEFAULT_CONFIG, DEFAULT_CONSTRAINTS, estimateParams, type ExperimentConfig, type ParamConstraints } from '$lib/model/config';
 	import { DataLoader } from '$lib/data/loader';
-	import { trainRun, type StepMetrics, type RunResult } from '$lib/train/loop';
+	import { executeTrainCode } from '$lib/research/sandbox';
+	import type { StepMetrics, ForwardFn, Params } from '$lib/prepare';
 	import { sampleText } from '$lib/sample';
 	import { ResearchController } from '$lib/research/controller';
 	import type { ExperimentRecord } from '$lib/research/prompt';
+	import { BASELINE_CODE } from '$lib/research/baseline';
 	import {
 		getDb, insertExperiment, insertInference, insertLossCurve, getAllExperiments,
 		getBestExperiment, getInferencesForExperiment, getAllLossCurves, clearAllData,
-		exportCsvZip, updateWeightsPath, rowToConfig, type ExperimentRow, type InferenceRow
+		exportCsvZip, updateWeightsPath, type ExperimentRow, type InferenceRow
 	} from '$lib/db';
 	import { saveWeights, loadWeights } from '$lib/weights';
 	import LossChart from '$lib/components/LossChart.svelte';
-	import ConfigEditor from '$lib/components/ConfigEditor.svelte';
+	import CodeEditor from '$lib/components/CodeEditor.svelte';
 	import Leaderboard from '$lib/components/Leaderboard.svelte';
-	import ConfigDiff from '$lib/components/ConfigDiff.svelte';
-	import ConstraintsModal from '$lib/components/ConstraintsModal.svelte';
 	import { petname } from '$lib/petname';
 
 	let gpuStatus = $state<WebGPUStatus | null>(null);
-	let config = $state<ExperimentConfig>({ ...DEFAULT_CONFIG });
+	let code = $state(BASELINE_CODE);
 	let running = $state(false);
 	let lossData = $state<{ step: number; loss: number }[]>([]);
 	let status = $state<string>('initializing');
-	let result = $state<RunResult | null>(null);
 	let sampling = $state(false);
 	let mode = $state<'manual' | 'research'>('research');
 	let experiments = $state<ExperimentRecord[]>([]);
 	let currentReasoning = $state('');
 	let experimentName = $state(petname());
-	let experimentDesc = $state('');
 	let listMode = $state<'leaderboard' | 'current'>('leaderboard');
 
-	// Inference state
+	// Inference state — we need to store forward fn + params for sampling
 	let prompt = $state('');
 	let temperature = $state(0.8);
 	let selectedExpId = $state<number | null>(null);
@@ -46,6 +43,12 @@
 	let trainAbort: AbortController | null = null;
 	let inProgressExp = $state<ExperimentRecord | null>(null);
 	let waitingForRecommendation = $state(false);
+
+	// In-memory forward function from last run (for inference)
+	let lastForwardFn: ForwardFn | null = null;
+	let lastParams: Params | null = null;
+	let lastVocabSize = 256;
+	let lastSeqLen = 128;
 
 	let allExperiments = $derived(
 		inProgressExp ? [...experiments, inProgressExp] : experiments
@@ -70,17 +73,13 @@
 			status = 'initializing';
 			await getDb();
 			gpuStatus = await initWebGPU();
-			if (!gpuStatus.ok) {
-				status = 'error';
-				return;
-			}
+			if (!gpuStatus.ok) { status = 'error'; return; }
 			status = 'loading data...';
 			[trainLoader, valLoader] = await Promise.all([
 				DataLoader.fetch('/data/train.bin'),
 				DataLoader.fetch('/data/val.bin')
 			]);
 			await loadFromDb();
-			// Restore state from URL
 			const params = new URL(window.location.href).searchParams;
 			const expParam = params.get('exp');
 			if (expParam) {
@@ -88,8 +87,6 @@
 				const exp = experiments.find(e => e.id === id);
 				if (exp) selectExperiment(exp);
 			}
-			const viewParam = params.get('view');
-			if (viewParam === 'current' || viewParam === 'leaderboard') listMode = viewParam;
 			status = 'ready';
 		} catch (e) {
 			console.error('Init failed:', e);
@@ -106,7 +103,7 @@
 		}));
 		const best = await getBestExperiment();
 		if (best) {
-			config = rowToConfig(best);
+			code = best.code;
 		}
 	}
 
@@ -115,12 +112,13 @@
 			id: row.id,
 			name: row.name,
 			source: row.source,
-			config: rowToConfig(row),
+			code: row.code,
 			valBpb: row.val_bpb,
 			elapsed: row.elapsed,
 			totalSteps: row.total_steps,
 			reasoning: row.reasoning,
 			kept: row.kept,
+			error: row.error ?? undefined,
 			lossCurve: row.loss_curve ?? undefined
 		};
 	}
@@ -130,95 +128,87 @@
 
 		running = true;
 		lossData = [];
-		result = null;
 		inferences = [];
 		inferenceIdx = 0;
 		status = 'training...';
 		currentRunName = experimentName || petname();
-		currentReasoning = experimentDesc || '';
-		trainLoader.reset();
+		currentReasoning = '';
 		trainAbort = new AbortController();
 		setListMode('current');
 
-		const runConfig = { ...config };
+		const runCode = code;
 		const lossCurve: { step: number; loss: number }[] = [];
 
-		// Create in-progress experiment for leaderboard
 		inProgressExp = {
-			id: -1,
-			name: currentRunName,
-			source: 'manual',
-			config: runConfig,
-			valBpb: Infinity,
-			elapsed: 0,
-			totalSteps: 0,
-			reasoning: currentReasoning,
-			kept: false,
+			id: -1, name: currentRunName, source: 'manual', code: runCode,
+			valBpb: Infinity, elapsed: 0, totalSteps: 0, reasoning: '', kept: false,
 		};
 
-		const r = await trainRun(runConfig, trainLoader, valLoader, {
+		const result = await executeTrainCode(runCode, trainLoader, valLoader, 30, {
 			signal: trainAbort.signal,
 			onStep(m: StepMetrics) {
 				lossData = [...lossData, { step: m.step, loss: m.loss }];
 				lossCurve.push({ step: m.step, loss: m.loss });
 				status = `step ${m.step} | loss ${m.loss.toFixed(4)} | ${(m.elapsed / 1000).toFixed(1)}s`;
-				// Update in-progress experiment with latest loss
 				if (inProgressExp) {
 					inProgressExp = { ...inProgressExp, valBpb: m.loss, totalSteps: m.step, elapsed: m.elapsed };
 				}
-			},
-			onDone(r: RunResult) {
-				result = r;
-				status = `done — val_bpb: ${r.valBpb.toFixed(4)} | ${r.totalSteps} steps | ${(r.elapsed / 1000).toFixed(1)}s`;
 			}
 		});
 		trainAbort = null;
 		inProgressExp = null;
 
-		const kept = experiments.length === 0 || r.valBpb < Math.min(...experiments.map(e => e.valBpb));
+		// Store forward fn for inference
+		lastForwardFn = result.forward;
+		lastParams = result.params;
+		lastVocabSize = result.vocabSize;
+		lastSeqLen = result.seqLen;
+
+		const kept = experiments.length === 0 || result.valBpb < Math.min(...experiments.map(e => e.valBpb));
 
 		const dbId = await insertExperiment({
 			name: experimentName || petname(),
 			source: 'manual',
-			config: runConfig,
-			valBpb: r.valBpb,
-			elapsed: r.elapsed,
-			totalSteps: r.totalSteps,
-			reasoning: experimentDesc || experimentName || 'Manual run',
+			code: runCode,
+			valBpb: result.valBpb,
+			elapsed: result.elapsed,
+			totalSteps: result.totalSteps,
+			reasoning: result.error || 'Manual run',
 			kept,
-			lossCurve
+			lossCurve,
+			error: result.error,
 		});
 
 		currentExpDbId = dbId;
-
-		// Save loss curve to normalized table
 		await insertLossCurve(dbId, lossCurve);
-
-		// Update leaderboard immediately
 		await loadFromDb();
-		await selectExperimentById(dbId);
-		status = `done — val_bpb: ${r.valBpb.toFixed(4)} | ${r.totalSteps} steps`;
+		selectExperimentById(dbId);
+		status = result.error
+			? `error: ${result.error}`
+			: `done — val_bpb: ${result.valBpb.toFixed(4)} | ${result.totalSteps} steps`;
 		running = false;
 		experimentName = petname();
-		experimentDesc = '';
 
-		// Save weights + generate sample in background (non-blocking)
-		(async () => {
-			try {
-				const weightsPath = await saveWeights(dbId, r.params);
-				await updateWeightsPath(dbId, weightsPath);
-			} catch (e) {
-				console.error('Failed to save weights:', e);
-			}
-			try {
-				const sampleOutput = await sampleText(r.params, runConfig, '', 200, 0.8);
-				await insertInference({ experimentId: dbId, prompt: '', output: sampleOutput, temperature: 0.8 });
-				if (selectedExpId === dbId) {
-					inferences = await getInferencesForExperiment(dbId);
-					inferenceIdx = 0;
+		// Save weights in background
+		if (result.params && Object.keys(result.params).length > 0) {
+			(async () => {
+				try {
+					const weightsPath = await saveWeights(dbId, result.params);
+					await updateWeightsPath(dbId, weightsPath);
+				} catch (e) { console.error('Failed to save weights:', e); }
+				// Generate sample
+				if (lastForwardFn) {
+					try {
+						const output = await sampleText(result.params, lastForwardFn, result.vocabSize, result.seqLen, '', 200, 0.8);
+						await insertInference({ experimentId: dbId, prompt: '', output, temperature: 0.8 });
+						if (selectedExpId === dbId) {
+							inferences = await getInferencesForExperiment(dbId);
+							inferenceIdx = 0;
+						}
+					} catch (_) {}
 				}
-			} catch (_) {}
-		})();
+			})();
+		}
 	}
 
 	async function startResearch() {
@@ -228,39 +218,28 @@
 		waitingForRecommendation = true;
 		lossData = [];
 		status = 'starting...';
-		currentRunName = '';
-		currentReasoning = '';
 		controller = new ResearchController();
-		controller.constraints = constraints;
 		setListMode('current');
 
 		const best = await getBestExperiment();
 		if (best) {
-			controller.bestConfig = rowToConfig(best);
+			controller.bestCode = best.code;
 			controller.bestBpb = best.val_bpb;
 			controller.history = [...experiments];
 		}
 
 		await controller.run(trainLoader, valLoader, {
-			onExperimentStart(cfg, reasoning) {
+			onExperimentStart(expCode, reasoning) {
 				waitingForRecommendation = false;
 				lossData = [];
-				config = { ...cfg };
+				code = expCode;
 				currentReasoning = reasoning;
 				currentRunName = petname();
 				status = `experiment: ${reasoning}`;
 				if (listMode === 'current') setSelectedExp(null);
-				// Create in-progress experiment
 				inProgressExp = {
-					id: -1,
-					name: currentRunName,
-					source: 'auto',
-					config: cfg,
-					valBpb: Infinity,
-					elapsed: 0,
-					totalSteps: 0,
-					reasoning,
-					kept: false,
+					id: -1, name: currentRunName, source: 'auto', code: expCode,
+					valBpb: Infinity, elapsed: 0, totalSteps: 0, reasoning, kept: false,
 				};
 			},
 			onStep(m: StepMetrics) {
@@ -275,7 +254,7 @@
 				await loadFromDb();
 				if (listMode === 'current') setSelectedExp(null);
 				if (record.kept && controller) {
-					config = { ...controller.bestConfig };
+					code = controller.bestCode;
 				}
 				status = `#${record.id} ${record.kept ? 'KEPT' : 'discarded'} — bpb ${record.valBpb.toFixed(4)}`;
 			},
@@ -298,42 +277,29 @@
 	function setSelectedExp(id: number | null) {
 		selectedExpId = id;
 		const url = new URL(window.location.href);
-		if (id != null) {
-			url.searchParams.set('exp', String(id));
-		} else {
-			url.searchParams.delete('exp');
-		}
+		if (id != null) url.searchParams.set('exp', String(id));
+		else url.searchParams.delete('exp');
 		history.replaceState(null, '', url);
 	}
 
 	function setListMode(m: 'leaderboard' | 'current') {
 		listMode = m;
-		if (m === 'current') {
-			// Clear selected experiment to show the live run
-			setSelectedExp(null);
-		}
-		const url = new URL(window.location.href);
-		url.searchParams.set('view', m);
-		history.replaceState(null, '', url);
+		if (m === 'current') setSelectedExp(null);
 	}
 
 	function selectExperimentById(id: number) {
 		setSelectedExp(id);
-		// Clear previous experiment's inference state
 		inferences = [];
 		inferenceIdx = 0;
 		streamingOutput = '';
 		sampling = false;
-		// Load inferences in background — don't block the UI
 		getInferencesForExperiment(id).then(rows => {
-			if (selectedExpId === id) {
-				inferences = rows;
-			}
+			if (selectedExpId === id) inferences = rows;
 		});
 	}
 
 	function selectExperiment(exp: ExperimentRecord) {
-		config = { ...exp.config };
+		code = exp.code;
 		selectExperimentById(exp.id);
 	}
 
@@ -341,24 +307,19 @@
 		if (sampling || !selectedExpId) return;
 		sampling = true;
 		try {
-			// Use in-memory params if available, otherwise load from OPFS
-			let params;
-			let expConfig: ExperimentConfig;
-			if (result && currentExpDbId === selectedExpId) {
-				params = result.params;
-				expConfig = config;
-			} else {
-				params = await loadWeights(selectedExpId);
+			// For inference we need the forward function. If it's the current run, use in-memory.
+			// Otherwise we'd need to re-execute the code or load weights — for now, only current run works.
+			if (!lastForwardFn || !lastParams || currentExpDbId !== selectedExpId) {
+				// Try to load weights and re-run code to get forward fn
 				const exp = experiments.find(e => e.id === selectedExpId);
-				expConfig = exp?.config ?? config;
-			}
-			if (!params) {
-				console.error('No weights available for experiment', selectedExpId);
+				if (!exp) { sampling = false; return; }
+				// TODO: re-execute code to rebuild forward fn from saved weights
+				console.warn('Inference only works on the most recently trained model');
 				sampling = false;
 				return;
 			}
 			streamingOutput = '';
-			const output = await sampleText(params, expConfig, prompt, 200, temperature, (text) => {
+			const output = await sampleText(lastParams, lastForwardFn, lastVocabSize, lastSeqLen, prompt, 200, temperature, (text) => {
 				streamingOutput = text;
 			});
 			await insertInference({ experimentId: selectedExpId, prompt, output, temperature });
@@ -372,22 +333,19 @@
 	}
 
 	let showClearModal = $state(false);
-	let showConstraints = $state(false);
-	let constraints = $state<ParamConstraints>({ ...DEFAULT_CONSTRAINTS });
-	const maxParams = 400_000_000;
 
-	function handleClear() {
-		showClearModal = true;
-	}
+	function handleClear() { showClearModal = true; }
 
 	async function confirmClear() {
 		showClearModal = false;
 		await clearAllData();
 		experiments = [];
-		config = { ...DEFAULT_CONFIG };
+		code = BASELINE_CODE;
 		setSelectedExp(null);
 		inferences = [];
 		currentExpDbId = null;
+		lastForwardFn = null;
+		lastParams = null;
 	}
 
 	async function handleExport() {
@@ -400,38 +358,31 @@
 		URL.revokeObjectURL(url);
 	}
 
-	let paramCount = $derived(estimateParams(config));
-	let paramCapExceeded = $derived(paramCount > maxParams);
-
 	let currentInference = $derived(inferences.length > 0 ? inferences[inferenceIdx] : null);
 	let selectedExp = $derived(selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null);
 	let hasAnyModel = $derived(experiments.length > 0 || running);
-	let loaded = $derived(status === 'ready' || status === 'error' || running || experiments.length > 0);
 	let isFirstLoad = $derived(experiments.length === 0 && !running && status !== 'error');
-
-	/** Previous experiment's config, for showing diff. */
-	let prevExpConfig = $derived.by(() => {
-		if (!selectedExp) return null;
-		const idx = experiments.findIndex(e => e.id === selectedExp!.id);
-		if (idx <= 0) return null;
-		return experiments[idx - 1].config;
-	});
 </script>
 
 <svelte:head>
 	<title>autoresearch-webgpu</title>
-	<meta name="description" content="Train small language models in your browser using WebGPU. Tune hyperparameters manually or let Claude do it automatically — a model training another model." />
+	<meta name="description" content="Train small language models in your browser using WebGPU. Claude writes the training code, runs experiments, and iterates — a model training another model!" />
 	<meta property="og:title" content="autoresearch-webgpu" />
-	<meta property="og:description" content="Train small language models in your browser using WebGPU. Tune hyperparameters manually or let Claude do it automatically — a model training another model." />
+	<meta property="og:description" content="Train small language models in your browser using WebGPU. Claude writes the training code, runs experiments, and iterates." />
 	<meta property="og:image" content="https://autoresearch.lucasgelfond.online/demo.gif" />
 	<meta property="og:type" content="website" />
 	<meta name="twitter:card" content="summary_large_image" />
 	<meta name="twitter:title" content="autoresearch-webgpu" />
-	<meta name="twitter:description" content="Train small language models in your browser using WebGPU. Tune hyperparameters manually or let Claude do it automatically." />
+	<meta name="twitter:description" content="Train small language models in your browser using WebGPU. Claude writes the training code and iterates." />
 	<meta name="twitter:image" content="https://autoresearch.lucasgelfond.online/demo.gif" />
 </svelte:head>
 
 <main class="px-6 py-12 max-w-6xl mx-auto space-y-5">
+	<!-- Mobile warning -->
+	<div class="md:hidden rounded border-2 border-red-600 bg-red-950 p-4 font-mono text-sm text-red-300 text-center leading-relaxed">
+		<span class="font-bold text-red-400">WARNING:</span> mobile devices often crash with memory intensive web activities. best results on a proper computer!
+	</div>
+
 	{#if gpuStatus && !gpuStatus.ok}
 		<div class="rounded border border-red-800 bg-red-950 p-4 font-mono text-sm text-red-400">
 			{gpuStatus.reason}
@@ -443,7 +394,7 @@
 				Based on Andrej Karpathy's <a href="https://github.com/karpathy/autoresearch" class="underline hover:text-gray-200">autoresearch</a> and built on Eric Zhang's <a href="https://github.com/ekzhang/jax-js" class="underline hover:text-gray-200">jax-js</a>. Built by <a href="https://lucasgelfond.online" class="underline hover:text-gray-200">Lucas Gelfond</a>. Source <a href="https://github.com/lucasgelfond/autoresearch-webgpu" class="underline hover:text-gray-200">here</a>.
 			</p>
 			<p class="text-[10px] font-mono text-gray-500 leading-relaxed">
-				This playground trains small language models inside of your browser. Part of this process involves tuning <a href="https://en.wikipedia.org/wiki/Hyperparameter_(machine_learning)" target="_blank" rel="noopener noreferrer" class="decoration-dotted underline underline-offset-2 decoration-gray-500 hover:text-gray-400 hover:decoration-gray-400">"hyperparameters,"</a> model training settings. You can set these manually, or use Claude to set them — a model training another model! Lower loss = better.
+				Claude writes training code, runs it in your browser via WebGPU, measures the result, and iterates. A model training another model! Lower loss = better.
 			</p>
 		</div>
 		{#if status === 'error'}
@@ -460,7 +411,7 @@
 					start research
 				</button>
 				<p class="text-xs font-mono text-gray-500 max-w-sm text-center">
-					begin by training a base model in your browser. you can then iterate manually, or let Claude suggest experiments automatically.
+					Claude will write training code, run it in your browser, and iterate to find better models.
 				</p>
 			{:else}
 				<p class="text-sm font-mono text-gray-500">{status === 'initializing' ? 'initializing...' : status}</p>
@@ -473,104 +424,66 @@
 					class="px-2.5 py-0.5 {mode === 'manual' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}"
 					onclick={() => (mode = 'manual')}
 					disabled={running}
-				>
-					manual
-				</button>
+				>manual</button>
 				<button
 					class="px-2.5 py-0.5 {mode === 'research' ? 'bg-blue-700 text-white' : 'text-gray-400 hover:text-white'}"
 					onclick={() => (mode = 'research')}
 					disabled={running}
-				>
-					auto
-				</button>
+				>auto</button>
 			</div>
-			<button
-				onclick={() => (showConstraints = true)}
-				class="text-gray-400 hover:text-white p-1"
-				title="set constraints"
-			>
-				<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4">
-					<path fill-rule="evenodd" d="M7.84 1.804A1 1 0 0 1 8.82 1h2.36a1 1 0 0 1 .98.804l.331 1.652a6.993 6.993 0 0 1 1.929 1.115l1.598-.54a1 1 0 0 1 1.186.447l1.18 2.044a1 1 0 0 1-.205 1.251l-1.267 1.113a7.047 7.047 0 0 1 0 2.228l1.267 1.113a1 1 0 0 1 .206 1.25l-1.18 2.045a1 1 0 0 1-1.187.447l-1.598-.54a6.993 6.993 0 0 1-1.929 1.115l-.33 1.652a1 1 0 0 1-.98.804H8.82a1 1 0 0 1-.98-.804l-.331-1.652a6.993 6.993 0 0 1-1.929-1.115l-1.598.54a1 1 0 0 1-1.186-.447l-1.18-2.044a1 1 0 0 1 .205-1.251l1.267-1.114a7.05 7.05 0 0 1 0-2.227L1.821 7.773a1 1 0 0 1-.206-1.25l1.18-2.045a1 1 0 0 1 1.187-.447l1.598.54A6.992 6.992 0 0 1 7.51 3.456l.33-1.652ZM10 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" clip-rule="evenodd" />
-				</svg>
-			</button>
 		</div>
 
-		<div class="grid grid-cols-1 md:grid-cols-[240px_1fr_240px] gap-4 md:h-[calc(100vh-20rem)]">
-			<!-- Left: config + controls -->
-			<div class="flex flex-col md:h-full">
-				<div class="rounded border border-gray-800 p-3 flex-1">
-					<div class="flex items-center justify-between mb-1">
-						<h2 class="text-xs font-mono text-gray-400">config</h2>
+		<div class="grid grid-cols-1 md:grid-cols-[1fr_1fr_240px] gap-4 md:h-[calc(100vh-20rem)]">
+			<!-- Left: train.ts code -->
+			<div class="flex flex-col md:h-full md:overflow-hidden">
+				<div class="flex flex-col flex-1 min-h-0">
+					<div class="flex items-center justify-between mb-2 shrink-0">
+						<h2 class="text-xs font-mono text-gray-400">train.ts</h2>
 						<button
-							onclick={() => (config = { ...DEFAULT_CONFIG })}
+							onclick={() => (code = BASELINE_CODE)}
 							disabled={running}
-							class="text-gray-500 hover:text-gray-300 disabled:opacity-30"
-							title="reset defaults"
-						>
-							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-3 h-3">
-								<path fill-rule="evenodd" d="M13.836 2.477a.75.75 0 0 1 .75.75v3.182a.75.75 0 0 1-.75.75h-3.182a.75.75 0 0 1 0-1.5h1.37l-.84-.841a4.5 4.5 0 0 0-7.08.932.75.75 0 0 1-1.3-.75 6 6 0 0 1 9.44-1.242l.842.84V3.227a.75.75 0 0 1 .75-.75Zm-.911 7.5A.75.75 0 0 1 13.199 11a6 6 0 0 1-9.44 1.241l-.84-.84v1.371a.75.75 0 0 1-1.5 0V9.591a.75.75 0 0 1 .75-.75H5.35a.75.75 0 0 1 0 1.5H3.98l.841.841a4.5 4.5 0 0 0 7.08-.932.75.75 0 0 1 1.025-.273Z" clip-rule="evenodd" />
-							</svg>
-						</button>
+							class="text-gray-500 hover:text-gray-300 disabled:opacity-30 text-[10px] font-mono"
+						>reset</button>
 					</div>
-					<ConfigEditor bind:config disabled={running} {constraints} />
+					<div class="flex-1 min-h-0">
+						<CodeEditor bind:value={code} disabled={running && mode === 'research'} />
+					</div>
 				</div>
-
-				{#if paramCapExceeded}
-					<div class="rounded border border-red-800 bg-red-950/50 px-3 py-2 font-mono text-xs text-red-400">
-						{(paramCount / 1e6).toFixed(1)}M params exceeds {(maxParams / 1e6).toFixed(0)}M cap
-					</div>
-				{/if}
-
-				<div class="mt-auto space-y-2 pt-2">
-				{#if mode === 'manual'}
-					<input
-						type="text"
-						bind:value={experimentName}
-						placeholder="experiment name..."
-						disabled={running}
-						class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40"
-					/>
-					<textarea
-						bind:value={experimentDesc}
-						placeholder="description / hypothesis..."
-						disabled={running}
-						rows={2}
-						class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-[11px] text-gray-200 placeholder-gray-500 disabled:opacity-40 resize-none"
-					></textarea>
-					{#if running}
-						<button
-							onclick={stopCurrentRun}
-							class="w-full rounded bg-red-600 hover:bg-red-500 px-3 py-1.5 font-mono text-xs transition-colors"
-						>
-							stop training
-						</button>
+				<div class="space-y-2 pt-2 shrink-0">
+					{#if mode === 'manual'}
+						<input
+							type="text"
+							bind:value={experimentName}
+							placeholder="experiment name..."
+							disabled={running}
+							class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40"
+						/>
+						{#if running}
+							<button onclick={stopCurrentRun}
+								class="w-full rounded bg-red-600 hover:bg-red-500 px-3 py-1.5 font-mono text-xs transition-colors">
+								stop training
+							</button>
+						{:else}
+							<button onclick={startManualTraining}
+								disabled={status === 'loading data...'}
+								class="w-full rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors">
+								run train.ts
+							</button>
+						{/if}
 					{:else}
-						<button
-							onclick={startManualTraining}
-							disabled={status === 'loading data...' || paramCapExceeded}
-							class="w-full rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors"
-						>
-							start training
-						</button>
+						{#if !running}
+							<button onclick={startResearch}
+								disabled={status === 'loading data...'}
+								class="w-full rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors">
+								start research
+							</button>
+						{:else}
+							<button onclick={stopCurrentRun}
+								class="w-full rounded bg-red-600 hover:bg-red-500 px-3 py-1.5 font-mono text-xs transition-colors">
+								stop
+							</button>
+						{/if}
 					{/if}
-				{:else}
-					{#if !running}
-						<button
-							onclick={startResearch}
-							disabled={status === 'loading data...'}
-							class="w-full rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors"
-						>
-							start research
-						</button>
-					{:else}
-						<button
-							onclick={stopCurrentRun}
-							class="w-full rounded bg-red-600 hover:bg-red-500 px-3 py-1.5 font-mono text-xs transition-colors"
-						>
-							stop
-						</button>
-					{/if}
-				{/if}
 				</div>
 			</div>
 
@@ -585,11 +498,11 @@
 							<span class="text-gray-200">{selectedExp.name}</span>
 							<span class="text-gray-500 tabular-nums ml-auto">{selectedExp.valBpb.toFixed(4)} bpb</span>
 						</div>
-						{#if prevExpConfig}
-							<ConfigDiff before={prevExpConfig} after={selectedExp.config} />
-						{/if}
-						{#if selectedExp.reasoning && selectedExp.reasoning !== selectedExp.name}
+						{#if selectedExp.reasoning}
 							<p class="text-[11px] text-gray-400 font-mono line-clamp-2" title={selectedExp.reasoning}>{selectedExp.reasoning}</p>
+						{/if}
+						{#if selectedExp.error}
+							<p class="text-[11px] text-red-400 font-mono line-clamp-2">error: {selectedExp.error}</p>
 						{/if}
 					{:else if running}
 						<div class="flex items-center gap-2 font-mono text-xs">
@@ -597,7 +510,7 @@
 								{waitingForRecommendation ? 'thinking' : 'running'}
 							</span>
 							<span class="text-gray-200">
-								{waitingForRecommendation ? 'Claude generating experiment ideas...' : currentRunName || 'training...'}
+								{waitingForRecommendation ? 'Claude writing code...' : currentRunName || 'training...'}
 							</span>
 						</div>
 						{#if currentReasoning && !waitingForRecommendation}
@@ -624,22 +537,12 @@
 								class="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40"
 								onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter') generateSample(); }}
 							/>
-							<input
-								type="number"
-								bind:value={temperature}
-								min={0.1}
-								max={2}
-								step={0.1}
+							<input type="number" bind:value={temperature} min={0.1} max={2} step={0.1}
 								disabled={!selectedExpId || sampling}
 								class="w-12 bg-gray-800 border border-gray-700 rounded px-1 py-1 text-right tabular-nums text-xs text-gray-200 font-mono disabled:opacity-40"
-								title="temperature"
-							/>
-							<button
-								onclick={generateSample}
-								disabled={!selectedExpId || sampling}
-								class="rounded bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 px-2 py-1 font-mono text-xs transition-colors"
-								title={!selectedExpId ? 'train a model to run inference' : ''}
-							>
+								title="temperature" />
+							<button onclick={generateSample} disabled={!selectedExpId || sampling}
+								class="rounded bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 px-2 py-1 font-mono text-xs transition-colors">
 								{sampling ? '...' : 'go'}
 							</button>
 						</div>
@@ -650,17 +553,11 @@
 								{#if inferences.length > 1}
 									<div class="flex items-center justify-end text-xs font-mono text-gray-500 mb-1">
 										<div class="flex items-center gap-1">
-											<button
-												onclick={() => { inferenceIdx = Math.min(inferenceIdx + 1, inferences.length - 1); }}
-												disabled={inferenceIdx >= inferences.length - 1}
-												class="px-1 hover:text-gray-300 disabled:opacity-30"
-											>←</button>
+											<button onclick={() => { inferenceIdx = Math.min(inferenceIdx + 1, inferences.length - 1); }}
+												disabled={inferenceIdx >= inferences.length - 1} class="px-1 hover:text-gray-300 disabled:opacity-30">←</button>
 											<span>{inferences.length - inferenceIdx}/{inferences.length}</span>
-											<button
-												onclick={() => { inferenceIdx = Math.max(inferenceIdx - 1, 0); }}
-												disabled={inferenceIdx <= 0}
-												class="px-1 hover:text-gray-300 disabled:opacity-30"
-											>→</button>
+											<button onclick={() => { inferenceIdx = Math.max(inferenceIdx - 1, 0); }}
+												disabled={inferenceIdx <= 0} class="px-1 hover:text-gray-300 disabled:opacity-30">→</button>
 										</div>
 									</div>
 								{/if}
@@ -670,37 +567,30 @@
 					</div>
 					{/if}
 				</div>
+			</div>
 
-				</div>
-
-			<!-- Right: leaderboard / history -->
+			<!-- Right: leaderboard -->
 			<div class="flex flex-col md:h-full md:overflow-hidden">
 				<div class="rounded border border-gray-800 p-3 flex flex-col flex-1 min-h-0">
 					<div class="flex items-center justify-between mb-2 shrink-0">
 						<div class="flex items-center gap-1 text-xs font-mono">
-							<button
-								class="{listMode === 'leaderboard' ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}"
-								onclick={() => setListMode('leaderboard')}
-							>leaderboard</button>
+							<button class="{listMode === 'leaderboard' ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}"
+								onclick={() => setListMode('leaderboard')}>leaderboard</button>
 							<span class="text-gray-600">/</span>
-							<button
-								class="{listMode === 'current' ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}"
-								onclick={() => setListMode('current')}
-							>history</button>
+							<button class="{listMode === 'current' ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}"
+								onclick={() => setListMode('current')}>history</button>
 						</div>
 						<span class="text-gray-500 text-[10px] font-mono">{experiments.length}</span>
 					</div>
 					<div class="flex-1 min-h-0 overflow-y-auto">
-						<Leaderboard experiments={allExperiments} onSelect={selectExperiment} selected={selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null} sortByLoss={listMode === 'leaderboard'} />
+						<Leaderboard experiments={allExperiments} onSelect={selectExperiment}
+							selected={selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null}
+							sortByLoss={listMode === 'leaderboard'} />
 					</div>
 					{#if experiments.length > 0}
 						<div class="flex gap-3 mt-2 pt-2 border-t border-gray-800 shrink-0">
-							<button onclick={handleExport} class="text-gray-500 hover:text-gray-300 text-xs font-mono">
-								export
-							</button>
-							<button onclick={handleClear} disabled={running} class="text-gray-500 hover:text-red-400 text-xs font-mono">
-								clear
-							</button>
+							<button onclick={handleExport} class="text-gray-500 hover:text-gray-300 text-xs font-mono">export</button>
+							<button onclick={handleClear} disabled={running} class="text-gray-500 hover:text-red-400 text-xs font-mono">clear</button>
 						</div>
 					{/if}
 				</div>
@@ -709,24 +599,14 @@
 		{/if}
 	{/if}
 
-	{#if showConstraints}
-		<ConstraintsModal bind:constraints onClose={() => (showConstraints = false)} />
-	{/if}
-
 	{#if showClearModal}
 		<div class="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
 			<div class="bg-gray-900 border border-gray-700 rounded-lg p-6 max-w-sm space-y-4 font-mono">
 				<h3 class="text-sm text-gray-200">clear all data?</h3>
 				<p class="text-xs text-gray-400">this will delete all experiments, loss curves, inferences, and saved weights. this cannot be undone.</p>
 				<div class="flex gap-2 justify-end">
-					<button
-						onclick={() => (showClearModal = false)}
-						class="px-3 py-1.5 rounded bg-gray-800 text-gray-300 hover:bg-gray-700 text-sm"
-					>cancel</button>
-					<button
-						onclick={confirmClear}
-						class="px-3 py-1.5 rounded bg-red-600 text-white hover:bg-red-500 text-sm"
-					>clear everything</button>
+					<button onclick={() => (showClearModal = false)} class="px-3 py-1.5 rounded bg-gray-800 text-gray-300 hover:bg-gray-700 text-sm">cancel</button>
+					<button onclick={confirmClear} class="px-3 py-1.5 rounded bg-red-600 text-white hover:bg-red-500 text-sm">clear everything</button>
 				</div>
 			</div>
 		</div>

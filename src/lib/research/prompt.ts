@@ -1,126 +1,131 @@
-import type { ExperimentConfig, ParamConstraints } from '../model/config';
-
 export type ExperimentRecord = {
 	id: number;
 	name: string;
 	source: 'manual' | 'auto';
-	config: ExperimentConfig;
+	code: string;
 	valBpb: number;
 	elapsed: number;
 	totalSteps: number;
 	reasoning: string;
 	kept: boolean;
-	sampleText?: string;
+	error?: string;
 	lossCurve?: { step: number; loss: number }[];
 };
 
-function rangeStr(c: ParamConstraints | undefined, key: string, fallback: string): string {
-	const r = c?.[key as keyof ParamConstraints];
-	if (!r) return fallback;
-	if (r.min != null && r.max != null) return `${r.min}-${r.max}`;
-	if (r.min != null) return `>=${r.min}`;
-	if (r.max != null) return `<=${r.max}`;
-	return fallback;
+/**
+ * System prompt with jax-js API reference.
+ * This is large (~3k tokens) and should be cached via Anthropic prompt caching.
+ */
+export function buildSystemPrompt(): string {
+	return `You are an autonomous ML researcher. You write training code that runs in the browser using WebGPU via jax-js.
+
+Your goal: minimize validation bits-per-byte (val_bpb). Lower is better.
+
+## Environment
+- You are running on a web interface in the browser with WebGPU (Apple M-series GPU, ~8GB shared memory)
+- Byte-level tokenizer (vocab_size=256), ~1MB Shakespeare dataset
+- Training budget: ~30 seconds wall-clock time. Aim for fast training steps.
+- Practical limit: ~300K parameters. Bigger models = fewer steps in the budget, which often hurts.
+- The sweet spot is small, fast models that get many training steps in 30 seconds.
+
+## Your code receives these globals
+
+### jax-js core (like JAX/numpy)
+- np.array(data, { dtype?, shape? }) — create array. dtype: np.float32, np.int32
+- np.zeros(shape), np.ones(shape) — constant arrays
+- np.arange(start, stop, step, { dtype }) — range (4th arg is options, NOT 3rd)
+- np.dot(a, b) — matrix multiply
+- np.concatenate([a, b], axis) — concatenate along axis
+- np.outer(a, b) — outer product
+- np.power(base, exp), np.negative(x), np.square(x), np.tanh(x)
+- np.cos(x), np.sin(x)
+- arr.mul(x), arr.add(x), arr.sub(x), arr.neg(), arr.sum(axis?)
+- arr.reshape(shape), arr.slice(...ranges) — e.g. arr.slice([], [], [], [0, half])
+- arr.shape — number array of dimensions
+
+### nn (neural network ops)
+- nn.standardize(x, axis, { epsilon }) — like layer norm without affine
+- nn.relu(x), nn.gelu(x), nn.silu(x) — activations
+- nn.softmax(x, axis?), nn.logSoftmax(x, axis?)
+- nn.oneHot(indices, numClasses) — one-hot encoding
+- nn.dotProductAttention(q, k, v, { isCausal }) — scaled dot-product attention
+
+### random
+- random.key(seed) — create PRNG key
+- random.split(key, num) — split key into multiple subkeys
+- random.normal(key, shape) — sample from N(0,1)
+- random.uniform(key, shape, { minval, maxval }) — uniform samples
+
+### tree & autodiff
+- tree.ref(params) — reference a param dict for autodiff (IMPORTANT: needed for valueAndGrad)
+- valueAndGrad(fn) — returns function that computes (value, gradients)
+- blockUntilReady(x) — await GPU computation
+
+### optimizer (optax-style)
+- adamw(lrFn, { weightDecay, b1, b2 }) — create AdamW optimizer. lrFn(step) returns lr
+- optimizer.init(params) — initialize optimizer state (pass tree.ref(params))
+- optimizer.update(grads, state, params) — returns [updates, newState]
+- applyUpdates(params, updates) — apply optimizer updates to params
+
+### data
+- trainData.nextBatch(batchSize, seqLen) → { input, target } (int32 arrays [B, T])
+- valData (same interface, for validation)
+
+### callbacks (you MUST call these)
+- onStep({ step, loss, elapsed }) — call every training step
+- onReturn({ params, forward, vocabSize, batchSize, seqLen, valBpb }) — call when done
+- signal.aborted — check this in your loop to support early stopping
+
+### utilities
+- lrSchedule(progress, warmupRatio, cooldownRatio) → multiplier in [0,1]
+- yieldToUI() — call periodically (await) to keep browser responsive
+- evaluate(params, forwardFn, vocabSize, valData, batchSize, seqLen) → Promise<number> (val_bpb)
+- VOCAB_SIZE — always 256
+- trainSeconds — wall-clock budget in seconds
+
+## CRITICAL: .ref ownership model
+jax-js uses reference counting. When an array is used in a computation, it is CONSUMED (freed).
+- Use arr.ref to create an extra reference when you need to use an array multiple times
+- The LAST use of an array should NOT use .ref (it consumes the original)
+- tree.ref(params) creates refs for all params in a dict
+- Example: x.ref.mul(a).add(x.mul(b)) — .ref on first use, consume on last
+
+## CRITICAL: Gather not implemented
+jax-js cannot differentiate through fancy indexing. For embeddings, use:
+  nn.oneHot(ids.reshape([-1]), VOCAB_SIZE) then np.dot(oneHot, embedMatrix)
+
+## Output format
+Respond with ONLY a JSON object:
+{
+  "reasoning": "one sentence explaining what you changed and why",
+  "code": "... your full training code as a string ..."
 }
 
-export function buildSystemPrompt(constraints?: ParamConstraints): string {
-	const c = constraints;
-	const maxP = c?.maxParams?.max ? `${(c.maxParams.max / 1e6).toFixed(1)}M` : '~3M';
-	const maxSec = c?.trainSeconds?.max ?? 60;
-
-	return `You are an autonomous ML researcher. You are training small GPT language models
-in the browser using WebGPU on an Apple M4. Your goal is to minimize validation
-bits-per-byte (val_bpb) — lower is better.
-
-The model is a transformer with:
-- Byte-level tokenizer (vocab_size=256)
-- RoPE positional embeddings
-- RMSNorm
-- Causal self-attention (standard, not flash)
-- Configurable MLP activation (relu², gelu, silu)
-- Optional softcap on logits
-
-You control these parameters via a JSON config:
-- nLayer (${rangeStr(c, 'nLayer', '2-8')}): number of transformer layers
-- nEmbd (${rangeStr(c, 'nEmbd', '64-256')}): embedding dimension (must be divisible by nHead)
-- nHead (${rangeStr(c, 'nHead', '2-8')}): number of attention heads
-- mlpRatio (${rangeStr(c, 'mlpRatio', '2-6')}): MLP hidden dim = nEmbd * mlpRatio
-- activation: "relu_sq" | "gelu" | "silu"
-- useRoPE: boolean
-- softcapValue: 0 (disabled) or positive number (e.g. 15)
-- lr (${rangeStr(c, 'lr', '1e-5 to 1e-2')}): learning rate
-- weightDecay (${rangeStr(c, 'weightDecay', '0 to 0.5')}): AdamW weight decay
-- warmupRatio (0 to 0.5): fraction of training for LR warmup
-- cooldownRatio (0 to 0.5): fraction of training for LR cooldown
-- batchSize (${rangeStr(c, 'batchSize', '4-32')}): batch size
-- seqLen (${rangeStr(c, 'seqLen', '64-256')}): sequence length
-- trainSeconds (${rangeStr(c, 'trainSeconds', '10-60')}): wall-clock training budget
-
-Constraints:
-- Total params MUST stay under ${maxP} (WebGPU memory limits)
-- Training runs for trainSeconds wall-clock, so bigger models = fewer steps
-- The dataset is ~1MB of Shakespeare text (byte-level)
-- Each experiment takes 10-${maxSec} seconds real time
-
-Strategy tips:
-- Start with small changes to understand what matters
-- Learning rate is usually the highest-leverage knob
-- Wider models (bigger nEmbd) often beat deeper ones at this scale
-- relu² tends to work well for small models
-- Don't change too many things at once`;
+The code field must be valid JavaScript that can run inside an async function.
+Do NOT include import statements, markdown fences, or comments about the JSON format.
+Keep the code concise. Do not add comments unless they clarify a non-obvious change.`;
 }
 
 export function buildUserPrompt(
 	history: ExperimentRecord[],
-	bestConfig: ExperimentConfig,
-	bestBpb: number,
-	constraints?: ParamConstraints
+	bestCode: string,
+	bestBpb: number
 ): string {
-	let msg = `Current best config (val_bpb = ${bestBpb.toFixed(4)}):\n`;
-	msg += '```json\n' + JSON.stringify(bestConfig, null, 2) + '\n```\n\n';
-
-	if (constraints) {
-		const lines: string[] = [];
-		for (const [key, c] of Object.entries(constraints)) {
-			if (!c) continue;
-			if (c.min != null && c.max != null) lines.push(`  ${key}: ${c.min} to ${c.max}`);
-			else if (c.min != null) lines.push(`  ${key}: >= ${c.min}`);
-			else if (c.max != null) lines.push(`  ${key}: <= ${c.max}`);
-		}
-		if (lines.length > 0) {
-			msg += 'HARD CONSTRAINTS (you must respect these):\n' + lines.join('\n') + '\n\n';
-		}
-	}
+	let msg = `Current best code (val_bpb = ${bestBpb.toFixed(4)}):\n`;
+	msg += '```\n' + bestCode + '\n```\n\n';
 
 	if (history.length > 0) {
 		msg += 'Experiment history (most recent first):\n';
 		const recent = history.slice(-10).reverse();
 		for (const exp of recent) {
 			const badge = exp.kept ? 'KEPT' : 'DISCARDED';
-			msg += `\n#${exp.id} [${badge}] val_bpb=${exp.valBpb.toFixed(4)} (${exp.totalSteps} steps, ${(exp.elapsed / 1000).toFixed(1)}s)\n`;
-			msg += `  Reasoning: ${exp.reasoning}\n`;
-			const diff = configDiff(bestConfig, exp.config);
-			if (diff) msg += `  Changes: ${diff}\n`;
+			msg += `\n#${exp.id} [${badge}] val_bpb=${exp.valBpb.toFixed(4)} (${exp.totalSteps} steps, ${(exp.elapsed / 1000).toFixed(1)}s)`;
+			msg += `\n  ${exp.reasoning}`;
+			if (exp.error) msg += `\n  ERROR: ${exp.error}`;
 		}
+		msg += '\n';
 	}
 
-	msg += `\nPropose the next experiment. Respond with ONLY a JSON object containing:
-{
-  "reasoning": "one sentence explaining your hypothesis",
-  "config": { ... full ExperimentConfig ... }
-}`;
-
+	msg += `\nPropose the next experiment. Respond with ONLY the JSON object.`;
 	return msg;
 }
-
-function configDiff(a: ExperimentConfig, b: ExperimentConfig): string {
-	const diffs: string[] = [];
-	for (const key of Object.keys(a) as (keyof ExperimentConfig)[]) {
-		if (a[key] !== b[key]) {
-			diffs.push(`${key}: ${a[key]} → ${b[key]}`);
-		}
-	}
-	return diffs.join(', ');
-}
-
-export { configDiff };

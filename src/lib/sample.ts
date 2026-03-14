@@ -1,11 +1,12 @@
 import { numpy as np, nn, blockUntilReady } from '@jax-js/jax';
-import type { ExperimentConfig } from './model/config';
-import { forward, type Params } from './model/gpt';
+import type { Params, ForwardFn } from './prepare';
 import { decode } from './data/tokenizer';
 
 export async function sampleText(
 	params: Params,
-	config: ExperimentConfig,
+	forwardFn: ForwardFn,
+	vocabSize: number,
+	seqLen: number,
 	prompt: string = '',
 	maxTokens: number = 200,
 	temperature: number = 0.8,
@@ -13,21 +14,16 @@ export async function sampleText(
 ): Promise<string> {
 	const encoder = new TextEncoder();
 	const promptBytes = prompt ? Array.from(encoder.encode(prompt)) : [0];
-
 	const tokens: number[] = [...promptBytes];
 
 	for (let i = 0; i < maxTokens; i++) {
-		// Take the last seqLen tokens as context
-		const contextStart = Math.max(0, tokens.length - config.seqLen);
+		const contextStart = Math.max(0, tokens.length - seqLen);
 		const context = tokens.slice(contextStart);
 
 		const inputIds = np.array(context, { dtype: np.int32 }).reshape([1, context.length]);
-		const logits = forward(params, config, inputIds);
+		const logits = forwardFn(params, inputIds);
 
-		// Get logits for the last position
-		const lastLogits = logits.slice(0, [-1]).reshape([config.vocabSize]);
-
-		// Temperature scaling + softmax sampling
+		const lastLogits = logits.slice(0, [-1]).reshape([vocabSize]);
 		const scaled = lastLogits.mul(1 / temperature);
 		const probs = nn.softmax(scaled);
 		await blockUntilReady(probs);

@@ -1,15 +1,14 @@
-import type { ExperimentConfig, ParamConstraints } from '../model/config';
-import { DEFAULT_CONFIG } from '../model/config';
 import { DataLoader } from '../data/loader';
-import { trainRun, type StepMetrics, type RunResult } from '../train/loop';
-import { sampleText } from '../sample';
+import { executeTrainCode, type RunResult } from './sandbox';
+import type { StepMetrics } from '../prepare';
 import { petname } from '../petname';
-import { insertExperiment, insertInference, insertLossCurve, updateWeightsPath } from '../db';
+import { insertExperiment, insertLossCurve, updateWeightsPath } from '../db';
 import { saveWeights } from '../weights';
 import { buildSystemPrompt, buildUserPrompt, type ExperimentRecord } from './prompt';
+import { BASELINE_CODE } from './baseline';
 
 export type ResearchCallbacks = {
-	onExperimentStart?: (config: ExperimentConfig, reasoning: string) => void;
+	onExperimentStart?: (code: string, reasoning: string) => void;
 	onStep?: (metrics: StepMetrics) => void;
 	onExperimentDone?: (record: ExperimentRecord) => void;
 	onError?: (error: string) => void;
@@ -17,18 +16,14 @@ export type ResearchCallbacks = {
 
 export class ResearchController {
 	history: ExperimentRecord[] = [];
-	bestConfig: ExperimentConfig;
+	bestCode: string = BASELINE_CODE;
 	bestBpb: number = Infinity;
 	running: boolean = false;
 	lastError = '';
-	constraints?: ParamConstraints;
+	trainSeconds = 30;
 	private stopRequested = false;
 	private runAbort: AbortController | null = null;
 	private fetchAbort: AbortController | null = null;
-
-	constructor() {
-		this.bestConfig = { ...DEFAULT_CONFIG };
-	}
 
 	stop() {
 		this.stopRequested = true;
@@ -48,29 +43,25 @@ export class ResearchController {
 		this.running = true;
 		this.stopRequested = false;
 
+		// Run baseline if no history
 		if (this.history.length === 0) {
 			await this.runExperiment(
-				this.bestConfig,
-				'Baseline run with default config.',
-				trainData,
-				valData,
-				callbacks
+				this.bestCode,
+				'Baseline run with default architecture.',
+				trainData, valData, callbacks
 			);
 		}
 
 		while (!this.stopRequested) {
-			const proposal = await this.getNextConfig();
+			const proposal = await this.getNextCode();
 			if (!proposal) {
-				callbacks.onError?.(this.lastError || 'Failed to get next config from Claude.');
+				callbacks.onError?.(this.lastError || 'Failed to get next code from Claude.');
 				break;
 			}
-
 			await this.runExperiment(
-				proposal.config,
+				proposal.code,
 				proposal.reasoning,
-				trainData,
-				valData,
-				callbacks
+				trainData, valData, callbacks
 			);
 		}
 
@@ -78,18 +69,18 @@ export class ResearchController {
 	}
 
 	private async runExperiment(
-		config: ExperimentConfig,
+		code: string,
 		reasoning: string,
 		trainData: DataLoader,
 		valData: DataLoader,
 		callbacks: ResearchCallbacks
 	) {
-		callbacks.onExperimentStart?.(config, reasoning);
+		callbacks.onExperimentStart?.(code, reasoning);
 
-		trainData.reset();
 		this.runAbort = new AbortController();
 		const lossCurve: { step: number; loss: number }[] = [];
-		const result = await trainRun(config, trainData, valData, {
+
+		const result = await executeTrainCode(code, trainData, valData, this.trainSeconds, {
 			signal: this.runAbort.signal,
 			onStep(m) {
 				lossCurve.push({ step: m.step, loss: m.loss });
@@ -98,55 +89,49 @@ export class ResearchController {
 		});
 		this.runAbort = null;
 
-		const kept = result.valBpb < this.bestBpb;
+		const kept = result.valBpb < this.bestBpb && !result.error;
 		if (kept) {
 			this.bestBpb = result.valBpb;
-			this.bestConfig = { ...config };
+			this.bestCode = code;
 		}
 
 		const expName = petname();
 		const dbId = await insertExperiment({
 			name: expName,
 			source: 'auto',
-			config,
+			code,
 			valBpb: result.valBpb,
 			elapsed: result.elapsed,
 			totalSteps: result.totalSteps,
 			reasoning,
 			kept,
-			lossCurve
+			lossCurve,
+			error: result.error,
 		});
 
-		// Save loss curve to normalized table
 		await insertLossCurve(dbId, lossCurve);
 
-		// Save weights to OPFS
-		try {
-			const weightsPath = await saveWeights(dbId, result.params);
-			await updateWeightsPath(dbId, weightsPath);
-		} catch (_) {}
-
-		// Generate sample in background — don't block next experiment
-		const bgParams = result.params;
-		const bgConfig = config;
-		(async () => {
-			try {
-				const output = await sampleText(bgParams, bgConfig, '', 200, 0.8);
-				await insertInference({ experimentId: dbId, prompt: '', output, temperature: 0.8 });
-			} catch (_) {}
-		})();
+		// Save weights in background
+		if (result.params && Object.keys(result.params).length > 0) {
+			(async () => {
+				try {
+					const weightsPath = await saveWeights(dbId, result.params);
+					await updateWeightsPath(dbId, weightsPath);
+				} catch (_) {}
+			})();
+		}
 
 		const record: ExperimentRecord = {
 			id: dbId,
 			name: expName,
 			source: 'auto',
-			config,
+			code,
 			valBpb: result.valBpb,
 			elapsed: result.elapsed,
 			totalSteps: result.totalSteps,
 			reasoning,
 			kept,
-			sampleText: '',
+			error: result.error,
 			lossCurve
 		};
 
@@ -154,9 +139,9 @@ export class ResearchController {
 		callbacks.onExperimentDone?.(record);
 	}
 
-	private async getNextConfig(): Promise<{ config: ExperimentConfig; reasoning: string } | null> {
-		const systemPrompt = buildSystemPrompt(this.constraints);
-		const userPrompt = buildUserPrompt(this.history, this.bestConfig, this.bestBpb, this.constraints);
+	private async getNextCode(): Promise<{ code: string; reasoning: string } | null> {
+		const systemPrompt = buildSystemPrompt();
+		const userPrompt = buildUserPrompt(this.history, this.bestCode, this.bestBpb);
 
 		this.fetchAbort = new AbortController();
 		try {
@@ -169,25 +154,27 @@ export class ResearchController {
 
 			if (!response.ok) {
 				const err = await response.text();
-				console.error('Research API error:', response.status, err);
 				this.lastError = `API ${response.status}: ${err.slice(0, 200)}`;
 				return null;
 			}
 
 			const data = await response.json();
 			if (data.error) {
-				console.error('Research API error:', data.error);
 				this.lastError = `API error: ${data.error}`;
 				return null;
 			}
 
+			if (!data.code || typeof data.code !== 'string') {
+				this.lastError = 'No code in API response';
+				return null;
+			}
+
 			return {
-				config: { ...this.bestConfig, ...data.config, vocabSize: 256 },
+				code: data.code,
 				reasoning: data.reasoning || 'No reasoning provided.'
 			};
 		} catch (e) {
 			if (this.stopRequested) return null;
-			console.error('Research API fetch failed:', e);
 			this.lastError = `Fetch failed: ${e}`;
 			return null;
 		} finally {

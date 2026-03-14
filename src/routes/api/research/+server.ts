@@ -1,16 +1,6 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 
-const cache = new Map<string, { data: unknown; ts: number }>();
-const CACHE_TTL = 1000 * 60 * 60; // 1 hour
-const MAX_CACHE = 200;
-
-async function hashKey(system: string, user: string): Promise<string> {
-	const data = new TextEncoder().encode(system + '\0' + user);
-	const buf = await crypto.subtle.digest('SHA-256', data);
-	return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
 export const POST: RequestHandler = async ({ request, platform }) => {
 	const apiKey = platform?.env?.ANTHROPIC_API_KEY;
 	if (!apiKey) {
@@ -28,24 +18,25 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 
 	const { systemPrompt, userPrompt } = await request.json();
 
-	// Check cache
-	const key = await hashKey(systemPrompt, userPrompt);
-	const cached = cache.get(key);
-	if (cached && Date.now() - cached.ts < CACHE_TTL) {
-		return json(cached.data);
-	}
-
 	const response = await fetch('https://api.anthropic.com/v1/messages', {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
 			'x-api-key': apiKey,
-			'anthropic-version': '2023-06-01'
+			'anthropic-version': '2023-06-01',
 		},
 		body: JSON.stringify({
 			model: 'claude-sonnet-4-6',
-			max_tokens: 1024,
-			system: systemPrompt,
+			max_tokens: 8192,
+			// Prompt caching: system prompt is large (API reference) and stable across calls.
+			// Using cache_control on the system block tells Anthropic to cache it.
+			system: [
+				{
+					type: 'text',
+					text: systemPrompt,
+					cache_control: { type: 'ephemeral' }
+				}
+			],
 			messages: [{ role: 'user', content: userPrompt }]
 		})
 	});
@@ -58,23 +49,44 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 	const data = await response.json();
 	const text = data.content[0].text;
 
-	const jsonMatch = text.match(/\{[\s\S]*\}/);
-	if (!jsonMatch) {
-		return json({ error: 'No JSON found in response', raw: text }, { status: 422 });
-	}
-
+	// Try to parse the JSON response. Claude should return { reasoning, code }.
+	// The code field contains braces, so we can't use a simple regex.
+	// Strategy: try JSON.parse on the full text first, then look for JSON block.
 	try {
-		const parsed = JSON.parse(jsonMatch[0]);
-
-		// Store in cache (evict oldest if full)
-		if (cache.size >= MAX_CACHE) {
-			const oldest = cache.keys().next().value!;
-			cache.delete(oldest);
+		const parsed = JSON.parse(text);
+		if (parsed.code && parsed.reasoning) {
+			return json(parsed);
 		}
-		cache.set(key, { data: parsed, ts: Date.now() });
-
-		return json(parsed);
 	} catch {
-		return json({ error: 'Invalid JSON in response', raw: text }, { status: 422 });
+		// Not direct JSON, try extracting from markdown fences or finding the JSON object
 	}
+
+	// Try to find JSON between ```json ... ``` or ``` ... ```
+	const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+	if (fenceMatch) {
+		try {
+			const parsed = JSON.parse(fenceMatch[1].trim());
+			if (parsed.code) return json(parsed);
+		} catch {}
+	}
+
+	// Last resort: find the outermost { ... } but be smarter about nested braces
+	try {
+		const start = text.indexOf('{');
+		if (start >= 0) {
+			let depth = 0;
+			let end = start;
+			for (let i = start; i < text.length; i++) {
+				if (text[i] === '{') depth++;
+				else if (text[i] === '}') {
+					depth--;
+					if (depth === 0) { end = i; break; }
+				}
+			}
+			const parsed = JSON.parse(text.slice(start, end + 1));
+			if (parsed.code) return json(parsed);
+		}
+	} catch {}
+
+	return json({ error: 'Could not parse response', raw: text.slice(0, 500) }, { status: 422 });
 };
