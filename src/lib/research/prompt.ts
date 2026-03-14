@@ -14,7 +14,20 @@ export type ExperimentRecord = {
 	lossCurve?: { step: number; loss: number }[];
 };
 
-export function buildSystemPrompt(): string {
+function rangeStr(c: ParamConstraints | undefined, key: string, fallback: string): string {
+	const r = c?.[key as keyof ParamConstraints];
+	if (!r) return fallback;
+	if (r.min != null && r.max != null) return `${r.min}-${r.max}`;
+	if (r.min != null) return `>=${r.min}`;
+	if (r.max != null) return `<=${r.max}`;
+	return fallback;
+}
+
+export function buildSystemPrompt(constraints?: ParamConstraints): string {
+	const c = constraints;
+	const maxP = c?.maxParams?.max ? `${(c.maxParams.max / 1e6).toFixed(1)}M` : '~3M';
+	const maxSec = c?.trainSeconds?.max ?? 60;
+
 	return `You are an autonomous ML researcher. You are training small GPT language models
 in the browser using WebGPU on an Apple M4. Your goal is to minimize validation
 bits-per-byte (val_bpb) — lower is better.
@@ -28,26 +41,26 @@ The model is a transformer with:
 - Optional softcap on logits
 
 You control these parameters via a JSON config:
-- nLayer (2-8): number of transformer layers
-- nEmbd (64-256): embedding dimension (must be divisible by nHead)
-- nHead (2-8): number of attention heads
-- mlpRatio (2-6): MLP hidden dim = nEmbd * mlpRatio
+- nLayer (${rangeStr(c, 'nLayer', '2-8')}): number of transformer layers
+- nEmbd (${rangeStr(c, 'nEmbd', '64-256')}): embedding dimension (must be divisible by nHead)
+- nHead (${rangeStr(c, 'nHead', '2-8')}): number of attention heads
+- mlpRatio (${rangeStr(c, 'mlpRatio', '2-6')}): MLP hidden dim = nEmbd * mlpRatio
 - activation: "relu_sq" | "gelu" | "silu"
 - useRoPE: boolean
 - softcapValue: 0 (disabled) or positive number (e.g. 15)
-- lr (1e-5 to 1e-2): learning rate
-- weightDecay (0 to 0.5): AdamW weight decay
+- lr (${rangeStr(c, 'lr', '1e-5 to 1e-2')}): learning rate
+- weightDecay (${rangeStr(c, 'weightDecay', '0 to 0.5')}): AdamW weight decay
 - warmupRatio (0 to 0.5): fraction of training for LR warmup
 - cooldownRatio (0 to 0.5): fraction of training for LR cooldown
-- batchSize (4-32): batch size
-- seqLen (64-256): sequence length
-- trainSeconds (10-60): wall-clock training budget
+- batchSize (${rangeStr(c, 'batchSize', '4-32')}): batch size
+- seqLen (${rangeStr(c, 'seqLen', '64-256')}): sequence length
+- trainSeconds (${rangeStr(c, 'trainSeconds', '10-60')}): wall-clock training budget
 
 Constraints:
-- Total params should stay under ~3M (WebGPU memory limits)
+- Total params MUST stay under ${maxP} (WebGPU memory limits)
 - Training runs for trainSeconds wall-clock, so bigger models = fewer steps
 - The dataset is ~1MB of Shakespeare text (byte-level)
-- Each experiment takes 10-60 seconds real time
+- Each experiment takes 10-${maxSec} seconds real time
 
 Strategy tips:
 - Start with small changes to understand what matters

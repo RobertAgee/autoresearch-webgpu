@@ -155,7 +155,7 @@ export class ResearchController {
 	}
 
 	private async getNextConfig(): Promise<{ config: ExperimentConfig; reasoning: string } | null> {
-		const systemPrompt = buildSystemPrompt();
+		const systemPrompt = buildSystemPrompt(this.constraints);
 		const userPrompt = buildUserPrompt(this.history, this.bestConfig, this.bestBpb, this.constraints);
 
 		this.fetchAbort = new AbortController();

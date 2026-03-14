@@ -34,7 +34,7 @@
 </script>
 
 <div class="space-y-1 text-xs font-mono">
-	<div class="text-gray-400 {overMaxParams ? 'text-yellow-400' : ''}">
+	<div class="text-gray-400 {overMaxParams ? 'text-red-400' : ''}">
 		~{(paramCount / 1e6).toFixed(2)}M params{#if maxParamsConstraint != null} <span class="text-gray-600">/ {(maxParamsConstraint / 1e6).toFixed(1)}M</span>{/if}
 	</div>
 
@@ -63,12 +63,4 @@
 			</select>
 		</label>
 	</div>
-
-	<button
-		onclick={() => (config = { ...DEFAULT_CONFIG })}
-		{disabled}
-		class="text-[10px] text-gray-500 hover:text-gray-300"
-	>
-		reset defaults
-	</button>
 </div>

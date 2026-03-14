@@ -240,6 +240,7 @@
 			onExperimentStart(cfg, reasoning) {
 				waitingForRecommendation = false;
 				lossData = [];
+				config = { ...cfg };
 				currentReasoning = reasoning;
 				currentRunName = petname();
 				status = `experiment: ${reasoning}`;
@@ -464,18 +465,31 @@
 
 		<div class="grid grid-cols-1 md:grid-cols-[240px_1fr_240px] gap-4 md:h-[calc(100vh-20rem)]">
 			<!-- Left: config + controls -->
-			<div class="space-y-2 md:overflow-y-auto md:h-full">
-				<div class="rounded border border-gray-800 p-3">
-					<h2 class="text-xs font-mono text-gray-400 mb-2">config</h2>
+			<div class="flex flex-col md:h-full">
+				<div class="rounded border border-gray-800 p-3 flex-1">
+					<div class="flex items-center justify-between mb-2">
+						<h2 class="text-xs font-mono text-gray-400">config</h2>
+						<button
+							onclick={() => (config = { ...DEFAULT_CONFIG })}
+							disabled={running}
+							class="text-gray-500 hover:text-gray-300 disabled:opacity-30"
+							title="reset defaults"
+						>
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-3 h-3">
+								<path fill-rule="evenodd" d="M13.836 2.477a.75.75 0 0 1 .75.75v3.182a.75.75 0 0 1-.75.75h-3.182a.75.75 0 0 1 0-1.5h1.37l-.84-.841a4.5 4.5 0 0 0-7.08.932.75.75 0 0 1-1.3-.75 6 6 0 0 1 9.44-1.242l.842.84V3.227a.75.75 0 0 1 .75-.75Zm-.911 7.5A.75.75 0 0 1 13.199 11a6 6 0 0 1-9.44 1.241l-.84-.84v1.371a.75.75 0 0 1-1.5 0V9.591a.75.75 0 0 1 .75-.75H5.35a.75.75 0 0 1 0 1.5H3.98l.841.841a4.5 4.5 0 0 0 7.08-.932.75.75 0 0 1 1.025-.273Z" clip-rule="evenodd" />
+							</svg>
+						</button>
+					</div>
 					<ConfigEditor bind:config disabled={running} {constraints} />
 				</div>
 
 				{#if paramCapExceeded}
-					<div class="rounded border border-yellow-800 bg-yellow-950/50 px-3 py-2 font-mono text-xs text-yellow-400">
+					<div class="rounded border border-red-800 bg-red-950/50 px-3 py-2 font-mono text-xs text-red-400">
 						{(paramCount / 1e6).toFixed(1)}M params exceeds {(maxParams / 1e6).toFixed(0)}M cap
 					</div>
 				{/if}
 
+				<div class="mt-auto space-y-2 pt-2">
 				{#if mode === 'manual'}
 					<input
 						type="text"
@@ -525,6 +539,7 @@
 						</button>
 					{/if}
 				{/if}
+				</div>
 			</div>
 
 			<!-- Center: chart + status + inference -->
