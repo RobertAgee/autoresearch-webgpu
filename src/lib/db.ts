@@ -186,6 +186,35 @@ export async function getInferencesForExperiment(experimentId: number): Promise<
 	return result.rows;
 }
 
+// -- Helpers --
+
+import type { ExperimentRecord } from './research/prompt';
+
+export function rowToRecord(row: ExperimentRow): ExperimentRecord {
+	return {
+		id: row.id,
+		name: row.name,
+		source: row.source,
+		code: row.code,
+		valBpb: row.val_bpb,
+		elapsed: row.elapsed,
+		totalSteps: row.total_steps,
+		reasoning: row.reasoning,
+		kept: row.kept,
+		error: row.error ?? undefined,
+		lossCurve: row.loss_curve ?? undefined
+	};
+}
+
+export async function getAllExperimentRecords(): Promise<ExperimentRecord[]> {
+	const rows = await getAllExperiments();
+	const lossCurvesMap = await getAllLossCurves();
+	return rows.map(row => ({
+		...rowToRecord(row),
+		lossCurve: lossCurvesMap.get(row.id) ?? row.loss_curve ?? undefined
+	}));
+}
+
 // -- Export --
 
 function toCsv(rows: Record<string, unknown>[]): string {

@@ -9,9 +9,9 @@
 	import type { ExperimentRecord } from '$lib/research/prompt';
 	import { BASELINE_CODE } from '$lib/research/baseline';
 	import {
-		getDb, insertExperiment, insertInference, insertLossCurve, getAllExperiments,
-		getBestExperiment, getInferencesForExperiment, getAllLossCurves, clearAllData,
-		exportCsvZip, updateWeightsPath, type ExperimentRow, type InferenceRow
+		getDb, insertExperiment, insertInference, insertLossCurve,
+		getBestExperiment, getInferencesForExperiment, clearAllData,
+		exportCsvZip, updateWeightsPath, getAllExperimentRecords, type InferenceRow
 	} from '$lib/db';
 	import { saveWeights, loadWeights } from '$lib/weights';
 	import LossChart from '$lib/components/LossChart.svelte';
@@ -37,18 +37,15 @@
 	let selectedExpId = $state<number | null>(null);
 	let inferences = $state<InferenceRow[]>([]);
 	let inferenceIdx = $state(0);
-	let currentExpDbId = $state<number | null>(null);
 	let streamingOutput = $state('');
 	let currentRunName = $state('');
 	let trainAbort: AbortController | null = null;
 	let inProgressExp = $state<ExperimentRecord | null>(null);
 	let waitingForRecommendation = $state(false);
 
-	// In-memory forward function from last run (for inference)
-	let lastForwardFn: ForwardFn | null = null;
-	let lastParams: Params | null = null;
-	let lastVocabSize = 256;
-	let lastSeqLen = 128;
+	// In-memory loaded model state for inference
+	type LoadedModel = { forward: ForwardFn; params: Params; vocabSize: number; seqLen: number; expId: number };
+	let loadedModel = $state<LoadedModel | null>(null);
 
 	let allExperiments = $derived(
 		inProgressExp ? [...experiments, inProgressExp] : experiments
@@ -95,32 +92,11 @@
 	});
 
 	async function loadFromDb() {
-		const rows = await getAllExperiments();
-		const lossCurvesMap = await getAllLossCurves();
-		experiments = rows.map(row => ({
-			...rowToRecord(row),
-			lossCurve: lossCurvesMap.get(row.id) ?? row.loss_curve ?? undefined
-		}));
+		experiments = await getAllExperimentRecords();
 		const best = await getBestExperiment();
 		if (best) {
 			code = best.code;
 		}
-	}
-
-	function rowToRecord(row: ExperimentRow): ExperimentRecord {
-		return {
-			id: row.id,
-			name: row.name,
-			source: row.source,
-			code: row.code,
-			valBpb: row.val_bpb,
-			elapsed: row.elapsed,
-			totalSteps: row.total_steps,
-			reasoning: row.reasoning,
-			kept: row.kept,
-			error: row.error ?? undefined,
-			lossCurve: row.loss_curve ?? undefined
-		};
 	}
 
 	async function startManualTraining() {
@@ -137,7 +113,6 @@
 		setListMode('current');
 
 		const runCode = code;
-		const lossCurve: { step: number; loss: number }[] = [];
 
 		inProgressExp = {
 			id: -1, name: currentRunName, source: 'manual', code: runCode,
@@ -148,7 +123,6 @@
 			signal: trainAbort.signal,
 			onStep(m: StepMetrics) {
 				lossData = [...lossData, { step: m.step, loss: m.loss }];
-				lossCurve.push({ step: m.step, loss: m.loss });
 				status = `step ${m.step} | loss ${m.loss.toFixed(4)} | ${(m.elapsed / 1000).toFixed(1)}s`;
 				if (inProgressExp) {
 					inProgressExp = { ...inProgressExp, valBpb: m.loss, totalSteps: m.step, elapsed: m.elapsed };
@@ -159,15 +133,18 @@
 		inProgressExp = null;
 
 		// Store forward fn for inference
-		lastForwardFn = result.forward;
-		lastParams = result.params;
-		lastVocabSize = result.vocabSize;
-		lastSeqLen = result.seqLen;
+		loadedModel = {
+			forward: result.forward,
+			params: result.params,
+			vocabSize: result.vocabSize,
+			seqLen: result.seqLen,
+			expId: -1, // updated after DB insert
+		};
 
 		const kept = experiments.length === 0 || result.valBpb < Math.min(...experiments.map(e => e.valBpb));
 
 		const dbId = await insertExperiment({
-			name: experimentName || petname(),
+			name: currentRunName,
 			source: 'manual',
 			code: runCode,
 			valBpb: result.valBpb,
@@ -175,12 +152,12 @@
 			totalSteps: result.totalSteps,
 			reasoning: result.error || 'Manual run',
 			kept,
-			lossCurve,
+			lossCurve: lossData,
 			error: result.error,
 		});
 
-		currentExpDbId = dbId;
-		await insertLossCurve(dbId, lossCurve);
+		loadedModel = { ...loadedModel, expId: dbId };
+		await insertLossCurve(dbId, lossData);
 		await loadFromDb();
 		selectExperimentById(dbId);
 		status = result.error
@@ -197,15 +174,15 @@
 					await updateWeightsPath(dbId, weightsPath);
 				} catch (e) { console.error('Failed to save weights:', e); }
 				// Generate sample
-				if (lastForwardFn) {
+				if (loadedModel?.forward) {
 					try {
-						const output = await sampleText(result.params, lastForwardFn, result.vocabSize, result.seqLen, '', 200, 0.8);
+						const output = await sampleText(result.params, loadedModel.forward, result.vocabSize, result.seqLen, '', 200, 0.8);
 						await insertInference({ experimentId: dbId, prompt: '', output, temperature: 0.8 });
 						if (selectedExpId === dbId) {
 							inferences = await getInferencesForExperiment(dbId);
 							inferenceIdx = 0;
 						}
-					} catch (_) {}
+					} catch (e) { console.error('Failed to generate sample:', e); }
 				}
 			})();
 		}
@@ -315,7 +292,7 @@
 		if (!exp) return false;
 
 		// If we already have this model loaded, skip
-		if (lastForwardFn && lastParams && currentExpDbId === expId) return true;
+		if (loadedModel && loadedModel.expId === expId) return true;
 
 		// Load saved weights
 		const savedParams = await loadWeights(expId);
@@ -331,11 +308,13 @@
 		if (!result.forward || result.error) return false;
 
 		// Use the saved weights (not the freshly-initialized ones)
-		lastForwardFn = result.forward;
-		lastParams = savedParams;
-		lastVocabSize = result.vocabSize;
-		lastSeqLen = result.seqLen;
-		currentExpDbId = expId;
+		loadedModel = {
+			forward: result.forward,
+			params: savedParams,
+			vocabSize: result.vocabSize,
+			seqLen: result.seqLen,
+			expId,
+		};
 		return true;
 	}
 
@@ -343,7 +322,7 @@
 		if (sampling || !selectedExpId) return;
 		sampling = true;
 		try {
-			if (!lastForwardFn || !lastParams || currentExpDbId !== selectedExpId) {
+			if (!loadedModel || loadedModel.expId !== selectedExpId) {
 				status = 'loading model...';
 				const loaded = await loadModelForExperiment(selectedExpId);
 				if (!loaded) {
@@ -355,7 +334,7 @@
 				status = 'ready';
 			}
 			streamingOutput = '';
-			const output = await sampleText(lastParams!, lastForwardFn!, lastVocabSize, lastSeqLen, prompt, 200, temperature, (text) => {
+			const output = await sampleText(loadedModel!.params, loadedModel!.forward, loadedModel!.vocabSize, loadedModel!.seqLen, prompt, 200, temperature, (text) => {
 				streamingOutput = text;
 			});
 			await insertInference({ experimentId: selectedExpId, prompt, output, temperature });
@@ -379,9 +358,7 @@
 		code = BASELINE_CODE;
 		setSelectedExp(null);
 		inferences = [];
-		currentExpDbId = null;
-		lastForwardFn = null;
-		lastParams = null;
+		loadedModel = null;
 	}
 
 	async function handleExport() {
@@ -620,7 +597,7 @@
 					</div>
 					<div class="flex-1 min-h-0 overflow-y-auto">
 						<Leaderboard experiments={allExperiments} onSelect={selectExperiment}
-							selected={selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null}
+							selected={selectedExp}
 							sortByLoss={listMode === 'leaderboard'} />
 					</div>
 					{#if experiments.length > 0}

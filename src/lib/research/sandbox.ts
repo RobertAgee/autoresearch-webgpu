@@ -29,78 +29,81 @@ export async function executeTrainCode(
 ): Promise<RunResult> {
 	const prepare = getPrepareGlobals();
 
-	return new Promise(async (resolve, reject) => {
-		let lastStep = 0;
-		let lastElapsed = 0;
+	let lastStep = 0;
+	let lastElapsed = 0;
+	let resolved = false;
 
-		const onStep = (m: StepMetrics) => {
-			lastStep = m.step;
-			lastElapsed = m.elapsed;
-			callbacks.onStep(m);
-		};
+	const onStep = (m: StepMetrics) => {
+		lastStep = m.step;
+		lastElapsed = m.elapsed;
+		callbacks.onStep(m);
+	};
 
-		const onReturn = (r: TrainResult & { valBpb?: number }) => {
-			resolve({
-				valBpb: r.valBpb ?? Infinity,
-				totalSteps: lastStep,
-				elapsed: lastElapsed,
-				params: r.params,
-				forward: r.forward,
-				vocabSize: r.vocabSize,
-				batchSize: r.batchSize,
-				seqLen: r.seqLen,
-			});
-		};
+	const { promise, resolve, reject } = Promise.withResolvers<RunResult>();
 
-		// Timeout: 2x the training budget (minimum 30s for model init/inference rebuild)
-		const timeoutMs = Math.max(trainSeconds * 2000, 30000);
-		const timeout = setTimeout(() => {
-			reject(new Error(`Training exceeded ${timeoutMs / 1000}s timeout`));
-		}, timeoutMs);
+	const onReturn = (r: TrainResult & { valBpb?: number }) => {
+		resolved = true;
+		resolve({
+			valBpb: r.valBpb ?? Infinity,
+			totalSteps: lastStep,
+			elapsed: lastElapsed,
+			params: r.params,
+			forward: r.forward,
+			vocabSize: r.vocabSize,
+			batchSize: r.batchSize,
+			seqLen: r.seqLen,
+		});
+	};
 
-		try {
-			// Build the function body with all globals destructured
-			const globalNames = Object.keys(prepare);
-			const callbackNames = ['trainData', 'valData', 'trainSeconds', 'signal', 'onStep', 'onReturn'];
+	// Timeout: 2x the training budget (minimum 30s for model init/inference rebuild)
+	const timeoutMs = Math.max(trainSeconds * 2000, 30000);
+	const timeout = setTimeout(() => {
+		if (!resolved) reject(new Error(`Training exceeded ${timeoutMs / 1000}s timeout`));
+	}, timeoutMs);
 
-			const fn = new Function(
-				'__prepare__',
-				'__callbacks__',
-				`
-				const { ${globalNames.join(', ')} } = __prepare__;
-				const { ${callbackNames.join(', ')} } = __callbacks__;
-				return (async () => {
-					${code}
-				})();
-				`
-			);
+	try {
+		// Build the function body with all globals destructured
+		const globalNames = Object.keys(prepare);
+		const callbackNames = ['trainData', 'valData', 'trainSeconds', 'signal', 'onStep', 'onReturn'];
 
-			trainData.reset();
-			await fn(prepare, {
-				trainData,
-				valData,
-				trainSeconds,
-				signal: callbacks.signal,
-				onStep,
-				onReturn,
-			});
-		} catch (e) {
-			clearTimeout(timeout);
-			const msg = e instanceof Error ? e.message : String(e);
-			// If onReturn was never called, resolve with error
-			resolve({
-				valBpb: Infinity,
-				totalSteps: lastStep,
-				elapsed: lastElapsed,
-				params: {},
-				forward: () => { throw new Error('no model'); },
-				vocabSize: 256,
-				batchSize: 8,
-				seqLen: 128,
-				error: msg,
-			});
-			return;
-		}
+		const fn = new Function(
+			'__prepare__',
+			'__callbacks__',
+			`
+			const { ${globalNames.join(', ')} } = __prepare__;
+			const { ${callbackNames.join(', ')} } = __callbacks__;
+			return (async () => {
+				${code}
+			})();
+			`
+		);
+
+		trainData.reset();
+		await fn(prepare, {
+			trainData,
+			valData,
+			trainSeconds,
+			signal: callbacks.signal,
+			onStep,
+			onReturn,
+		});
+	} catch (e) {
 		clearTimeout(timeout);
-	});
+		const msg = e instanceof Error ? e.message : String(e);
+		// If onReturn was never called, resolve with error
+		return {
+			valBpb: Infinity,
+			totalSteps: lastStep,
+			elapsed: lastElapsed,
+			params: {},
+			forward: () => { throw new Error('no model'); },
+			vocabSize: 256,
+			batchSize: 8,
+			seqLen: 128,
+			error: msg,
+		};
+	}
+	clearTimeout(timeout);
+
+	return promise;
 }

@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import { dev } from '$app/environment';
 import type { RequestHandler } from './$types';
+import { parseClaudeResponse } from '$lib/research/parse';
 
 const ALLOWED_ORIGIN = 'https://autoresearch.lucasgelfond.online';
 
@@ -83,31 +84,8 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 	const data = await response.json();
 	const text = data.content[0].text;
 
-	try {
-		const parsed = JSON.parse(text);
-		if (parsed.code && parsed.reasoning) return json(parsed);
-	} catch {}
-
-	const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-	if (fenceMatch) {
-		try {
-			const parsed = JSON.parse(fenceMatch[1].trim());
-			if (parsed.code) return json(parsed);
-		} catch {}
-	}
-
-	try {
-		const start = text.indexOf('{');
-		if (start >= 0) {
-			let depth = 0, end = start;
-			for (let i = start; i < text.length; i++) {
-				if (text[i] === '{') depth++;
-				else if (text[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
-			}
-			const parsed = JSON.parse(text.slice(start, end + 1));
-			if (parsed.code) return json(parsed);
-		}
-	} catch {}
+	const parsed = parseClaudeResponse(text);
+	if (parsed) return json(parsed);
 
 	return json({ error: 'Could not parse response', raw: text.slice(0, 500) }, { status: 422 });
 };

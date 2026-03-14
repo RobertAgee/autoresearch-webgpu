@@ -1,6 +1,6 @@
 import { numpy as np } from '@jax-js/jax';
 import { opfs } from '@jax-js/loaders';
-import type { Params } from './model/gpt';
+import type { Params } from './prepare';
 
 type ParamMeta = { key: string; shape: number[]; dtype: string; offset: number; byteLength: number };
 
@@ -75,9 +75,4 @@ export async function loadWeights(experimentId: number): Promise<Params | null> 
 	}
 
 	return params;
-}
-
-export async function deleteWeights(experimentId: number): Promise<void> {
-	await opfs.remove(`weights/exp-${experimentId}.bin`).catch(() => {});
-	await opfs.remove(`weights/exp-${experimentId}.meta.json`).catch(() => {});
 }

@@ -6,6 +6,7 @@ import { insertExperiment, insertLossCurve, updateWeightsPath } from '../db';
 import { saveWeights } from '../weights';
 import { buildSystemPrompt, buildUserPrompt, type ExperimentRecord } from './prompt';
 import { BASELINE_CODE } from './baseline';
+import { parseClaudeResponse } from './parse';
 
 export type ResearchCallbacks = {
 	onExperimentStart?: (code: string, reasoning: string) => void;
@@ -117,7 +118,7 @@ export class ResearchController {
 				try {
 					const weightsPath = await saveWeights(dbId, result.params);
 					await updateWeightsPath(dbId, weightsPath);
-				} catch (_) {}
+				} catch (e) { console.error('Failed to save weights:', e); }
 			})();
 		}
 
@@ -267,33 +268,8 @@ export class ResearchController {
 	}
 
 	private parseResponse(text: string): { code: string; reasoning: string } | null {
-		try {
-			const parsed = JSON.parse(text);
-			if (parsed.code && parsed.reasoning) return parsed;
-		} catch {}
-
-		const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-		if (fenceMatch) {
-			try {
-				const parsed = JSON.parse(fenceMatch[1].trim());
-				if (parsed.code) return { code: parsed.code, reasoning: parsed.reasoning || '' };
-			} catch {}
-		}
-
-		try {
-			const start = text.indexOf('{');
-			if (start >= 0) {
-				let depth = 0, end = start;
-				for (let i = start; i < text.length; i++) {
-					if (text[i] === '{') depth++;
-					else if (text[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
-				}
-				const parsed = JSON.parse(text.slice(start, end + 1));
-				if (parsed.code) return { code: parsed.code, reasoning: parsed.reasoning || '' };
-			}
-		} catch {}
-
-		this.lastError = 'Could not parse Claude response';
-		return null;
+		const result = parseClaudeResponse(text);
+		if (!result) this.lastError = 'Could not parse Claude response';
+		return result;
 	}
 }
