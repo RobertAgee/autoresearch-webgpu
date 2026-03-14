@@ -14,6 +14,9 @@ importers:
       '@jax-js/jax':
         specifier: ^0.1.0
         version: 0.1.9
+      '@jax-js/loaders':
+        specifier: ^0.1.1
+        version: 0.1.1
       '@jax-js/optax':
         specifier: ^0.1.0
         version: 0.1.2
@@ -50,6 +53,9 @@ importers:
         version: 6.4.1(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)
 
 packages:
+
+  '@bufbuild/protobuf@2.11.0':
+    resolution: {integrity: sha512-sBXGT13cpmPR5BMgHE6UEEfEaShh5Ror6rfN3yEK5si7QVrtZg8LEPQb0VVhiLRUslD2yLnXtnRzG035J/mZXQ==}
 
   '@electric-sql/pglite@0.3.16':
     resolution: {integrity: sha512-mZkZfOd9OqTMHsK+1cje8OSzfAQcpD7JmILXTl5ahdempjUDdmg4euf1biDex5/LfQIDJ3gvCu6qDgdnDxfJmA==}
@@ -369,6 +375,9 @@ packages:
   '@jax-js/jax@0.1.9':
     resolution: {integrity: sha512-Y9/HszPH/Cvy5tuak+4greCZwtNwJhm3/tLJCYk/3Zy3NKzndiMmum99hPx3PQxafHi+HnY3D1Xz6favJewxXA==}
     engines: {pnpm: '>=10.0.0'}
+
+  '@jax-js/loaders@0.1.1':
+    resolution: {integrity: sha512-QE7+UKQL0ySFFKVWXA3b/jSyBEhwZCjDD3rzUihTwEU16hU6V/bqqTMx6e94c/bHY+8pOs65Bqj19HQbKuiwGQ==}
 
   '@jax-js/optax@0.1.2':
     resolution: {integrity: sha512-pJ/N0FIlrZTRALTc2rlAFSDEn/wBXbpaiqpaw2a+vwH+Br/fCX5dZ1ZckZFTG+iTPOm+oZ/xA+cjaocu47+0HA==}
@@ -887,6 +896,10 @@ packages:
     engines: {node: '>=18.0.0', npm: '>=8.0.0'}
     hasBin: true
 
+  sentencepiece-buf@0.2.1-0:
+    resolution: {integrity: sha512-EUNi6hvPjHr2Jcmy3gFdV+elNNsrDTnkVyJJEMGVFSbXAWacW8gNP0cQEIAG5eGk5Kz46Vc23XZ7udOQeX126Q==}
+    engines: {pnpm: '>=10.0.0'}
+
   set-cookie-parser@3.0.1:
     resolution: {integrity: sha512-n7Z7dXZhJbwuAHhNzkTti6Aw9QDDjZtm3JTpTGATIdNzdQz5GuFs22w90BcvF4INfnrL5xrX3oGsuqO5Dx3A1Q==}
 
@@ -979,6 +992,8 @@ packages:
     resolution: {integrity: sha512-B58NGBEoc8Y9MWWCQGl/gq9xBCe4IiKM0a2x7GZdQKOW5Exr8S1W24J6OgM1njK8xCRGvAJIL/MxXHf6SkmQKQ==}
 
 snapshots:
+
+  '@bufbuild/protobuf@2.11.0': {}
 
   '@electric-sql/pglite@0.3.16': {}
 
@@ -1139,6 +1154,11 @@ snapshots:
     optional: true
 
   '@jax-js/jax@0.1.9': {}
+
+  '@jax-js/loaders@0.1.1':
+    dependencies:
+      '@bufbuild/protobuf': 2.11.0
+      sentencepiece-buf: 0.2.1-0
 
   '@jax-js/optax@0.1.2':
     dependencies:
@@ -1584,6 +1604,10 @@ snapshots:
       '@rollup/rollup-win32-x64-gnu': 4.59.0
       '@rollup/rollup-win32-x64-msvc': 4.59.0
       fsevents: 2.3.3
+
+  sentencepiece-buf@0.2.1-0:
+    dependencies:
+      '@bufbuild/protobuf': 2.11.0
 
   set-cookie-parser@3.0.1: {}
 

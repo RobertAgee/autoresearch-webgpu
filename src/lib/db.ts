@@ -16,8 +16,18 @@ export async function getDb(): Promise<PGlite> {
 			reasoning TEXT NOT NULL DEFAULT '',
 			kept BOOLEAN NOT NULL DEFAULT false,
 			loss_curve JSONB,
+			weights_path TEXT,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
+
+		CREATE TABLE IF NOT EXISTS loss_steps (
+			id SERIAL PRIMARY KEY,
+			experiment_id INTEGER NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+			step INTEGER NOT NULL,
+			loss REAL NOT NULL
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_loss_steps_exp ON loss_steps(experiment_id);
 
 		CREATE TABLE IF NOT EXISTS inferences (
 			id SERIAL PRIMARY KEY,
@@ -43,6 +53,7 @@ export type ExperimentRow = {
 	reasoning: string;
 	kept: boolean;
 	loss_curve: { step: number; loss: number }[] | null;
+	weights_path: string | null;
 	created_at: string;
 };
 
@@ -91,9 +102,50 @@ export async function getBestExperiment(): Promise<ExperimentRow | null> {
 	return result.rows[0] ?? null;
 }
 
+export async function updateWeightsPath(id: number, weightsPath: string): Promise<void> {
+	const pg = await getDb();
+	await pg.query(`UPDATE experiments SET weights_path = $1 WHERE id = $2`, [weightsPath, id]);
+}
+
 export async function clearAllData(): Promise<void> {
 	const pg = await getDb();
-	await pg.exec(`DELETE FROM inferences; DELETE FROM experiments;`);
+	await pg.exec(`DELETE FROM inferences; DELETE FROM loss_steps; DELETE FROM experiments;`);
+}
+
+// -- Loss Steps --
+
+export async function insertLossCurve(experimentId: number, curve: { step: number; loss: number }[]): Promise<void> {
+	if (curve.length === 0) return;
+	const pg = await getDb();
+	// Batch insert
+	const values = curve.map((_, i) => `($1, $${i * 2 + 2}, $${i * 2 + 3})`).join(',');
+	const params: (number)[] = [experimentId];
+	for (const point of curve) {
+		params.push(point.step, point.loss);
+	}
+	await pg.query(`INSERT INTO loss_steps (experiment_id, step, loss) VALUES ${values}`, params);
+}
+
+export async function getLossCurve(experimentId: number): Promise<{ step: number; loss: number }[]> {
+	const pg = await getDb();
+	const result = await pg.query<{ step: number; loss: number }>(
+		`SELECT step, loss FROM loss_steps WHERE experiment_id = $1 ORDER BY step`,
+		[experimentId]
+	);
+	return result.rows;
+}
+
+export async function getAllLossCurves(): Promise<Map<number, { step: number; loss: number }[]>> {
+	const pg = await getDb();
+	const result = await pg.query<{ experiment_id: number; step: number; loss: number }>(
+		`SELECT experiment_id, step, loss FROM loss_steps ORDER BY experiment_id, step`
+	);
+	const map = new Map<number, { step: number; loss: number }[]>();
+	for (const row of result.rows) {
+		if (!map.has(row.experiment_id)) map.set(row.experiment_id, []);
+		map.get(row.experiment_id)!.push({ step: row.step, loss: row.loss });
+	}
+	return map;
 }
 
 // -- Inferences --

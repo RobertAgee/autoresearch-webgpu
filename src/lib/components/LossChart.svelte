@@ -1,6 +1,6 @@
 <script lang="ts">
 	type Point = { step: number; loss: number };
-	type Series = { data: Point[]; color: string; label?: string };
+	type Series = { data: Point[]; color: string; label?: string; highlight?: boolean };
 
 	let { data, pastRuns = [] }: { data: Point[]; pastRuns?: Series[] } = $props();
 
@@ -78,12 +78,15 @@
 		ctx.fillText(maxLoss.toFixed(2), pad.left - 5, pad.top + 10);
 		ctx.fillText(minLoss.toFixed(2), pad.left - 5, h - pad.bottom);
 
-		// Draw each series
-		for (const s of allSeries) {
+		// Draw non-highlighted series first, then highlighted on top
+		const sorted = [...allSeries].sort((a, b) => (a.highlight ? 1 : 0) - (b.highlight ? 1 : 0));
+		for (const s of sorted) {
 			if (s.data.length < 2) continue;
+			const isCurrent = s.label === 'current';
+			const isHighlight = s.highlight;
 			ctx.strokeStyle = s.color;
-			ctx.lineWidth = s.label === 'current' ? 1.5 : 1;
-			ctx.globalAlpha = s.label === 'current' ? 1 : 0.4;
+			ctx.lineWidth = isCurrent ? 1.5 : isHighlight ? 2 : 1;
+			ctx.globalAlpha = isCurrent ? 1 : isHighlight ? 1 : 0.25;
 			ctx.beginPath();
 			for (let i = 0; i < s.data.length; i++) {
 				const x = xScale(s.data[i].step);

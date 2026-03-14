@@ -8,10 +8,11 @@
 	import { ResearchController } from '$lib/research/controller';
 	import type { ExperimentRecord } from '$lib/research/prompt';
 	import {
-		getDb, insertExperiment, insertInference, getAllExperiments,
-		getBestExperiment, getInferencesForExperiment, clearAllData,
-		exportExperimentsJson, type ExperimentRow, type InferenceRow
+		getDb, insertExperiment, insertInference, insertLossCurve, getAllExperiments,
+		getBestExperiment, getInferencesForExperiment, getAllLossCurves, clearAllData,
+		exportExperimentsJson, updateWeightsPath, type ExperimentRow, type InferenceRow
 	} from '$lib/db';
+	import { saveWeights, loadWeights } from '$lib/weights';
 	import LossChart from '$lib/components/LossChart.svelte';
 	import ConfigEditor from '$lib/components/ConfigEditor.svelte';
 	import ResearchLog from '$lib/components/ResearchLog.svelte';
@@ -43,7 +44,8 @@
 			.filter(e => e.lossCurve && e.lossCurve.length > 1)
 			.map(e => ({
 				data: e.lossCurve!,
-				color: e.kept ? '#22c55e' : '#6b7280'
+				color: e.id === selectedExpId ? '#ef4444' : e.kept ? '#22c55e' : '#4b5563',
+				highlight: e.id === selectedExpId
 			}))
 	);
 
@@ -65,9 +67,15 @@
 		}
 	});
 
+	let lossCurvesMap = $state(new Map<number, { step: number; loss: number }[]>());
+
 	async function loadFromDb() {
 		const rows = await getAllExperiments();
-		experiments = rows.map(rowToRecord);
+		lossCurvesMap = await getAllLossCurves();
+		experiments = rows.map(row => ({
+			...rowToRecord(row),
+			lossCurve: lossCurvesMap.get(row.id) ?? row.loss_curve ?? undefined
+		}));
 		const best = await getBestExperiment();
 		if (best) {
 			config = best.config as ExperimentConfig;
@@ -129,18 +137,35 @@
 
 		currentExpDbId = dbId;
 
-		// Auto-generate a sample
-		status = 'generating sample...';
-		try {
-			const sampleOutput = await sampleText(r.params, runConfig, '', 200, 0.8);
-			await insertInference({ experimentId: dbId, prompt: '', output: sampleOutput, temperature: 0.8 });
-		} catch (_) {}
+		// Save loss curve to normalized table
+		await insertLossCurve(dbId, lossCurve);
 
+		// Save weights to OPFS, update DB with path
+		status = 'saving weights...';
+		try {
+			const weightsPath = await saveWeights(dbId, r.params);
+			await updateWeightsPath(dbId, weightsPath);
+		} catch (e) {
+			console.error('Failed to save weights:', e);
+		}
+
+		// Update leaderboard immediately
 		await loadFromDb();
 		await selectExperimentById(dbId);
-
-		status = `done — val_bpb: ${r.valBpb.toFixed(4)} | ${r.totalSteps} steps | ${(r.elapsed / 1000).toFixed(1)}s`;
+		status = `done — val_bpb: ${r.valBpb.toFixed(4)} | ${r.totalSteps} steps`;
 		running = false;
+
+		// Generate sample in background (non-blocking)
+		(async () => {
+			try {
+				const sampleOutput = await sampleText(r.params, runConfig, '', 200, 0.8);
+				await insertInference({ experimentId: dbId, prompt: '', output: sampleOutput, temperature: 0.8 });
+				if (selectedExpId === dbId) {
+					inferences = await getInferencesForExperiment(dbId);
+					inferenceIdx = 0;
+				}
+			} catch (_) {}
+		})();
 	}
 
 	async function startResearch() {
@@ -196,12 +221,28 @@
 	}
 
 	async function generateSample() {
-		if (!result || sampling || !currentExpDbId) return;
+		if (sampling || !selectedExpId) return;
 		sampling = true;
 		try {
-			const output = await sampleText(result.params, config, prompt, 200, temperature);
-			await insertInference({ experimentId: currentExpDbId, prompt, output, temperature });
-			inferences = await getInferencesForExperiment(currentExpDbId);
+			// Use in-memory params if available, otherwise load from OPFS
+			let params;
+			let expConfig: ExperimentConfig;
+			if (result && currentExpDbId === selectedExpId) {
+				params = result.params;
+				expConfig = config;
+			} else {
+				params = await loadWeights(selectedExpId);
+				const exp = experiments.find(e => e.id === selectedExpId);
+				expConfig = exp?.config ?? config;
+			}
+			if (!params) {
+				console.error('No weights available for experiment', selectedExpId);
+				sampling = false;
+				return;
+			}
+			const output = await sampleText(params, expConfig, prompt, 200, temperature);
+			await insertInference({ experimentId: selectedExpId, prompt, output, temperature });
+			inferences = await getInferencesForExperiment(selectedExpId);
 			inferenceIdx = 0;
 		} catch (e) {
 			console.error('Inference failed:', e);
@@ -344,7 +385,7 @@
 								type="text"
 								bind:value={prompt}
 								placeholder="prompt..."
-								disabled={!result || sampling}
+								disabled={!selectedExpId || sampling}
 								class="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40"
 								onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter') generateSample(); }}
 							/>
@@ -354,13 +395,13 @@
 								min={0.1}
 								max={2}
 								step={0.1}
-								disabled={!result || sampling}
+								disabled={!selectedExpId || sampling}
 								class="w-12 bg-gray-800 border border-gray-700 rounded px-1 py-1 text-right tabular-nums text-xs text-gray-200 font-mono disabled:opacity-40"
 								title="temperature"
 							/>
 							<button
 								onclick={generateSample}
-								disabled={!result || sampling}
+								disabled={!selectedExpId || sampling}
 								class="rounded bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 px-2 py-1 font-mono text-xs transition-colors"
 							>
 								{sampling ? '...' : 'go'}
@@ -389,7 +430,7 @@
 								{/if}
 							</div>
 							<pre class="text-xs text-gray-300 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-48 overflow-y-auto">{currentInference.output}</pre>
-						{:else if !result}
+						{:else if !selectedExpId}
 							<p class="text-gray-500 text-xs font-mono">train a model to generate text</p>
 						{/if}
 					</div>

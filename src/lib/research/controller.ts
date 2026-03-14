@@ -3,7 +3,8 @@ import { DEFAULT_CONFIG } from '../model/config';
 import { DataLoader } from '../data/loader';
 import { trainRun, type StepMetrics, type RunResult } from '../train/loop';
 import { sampleText } from '../sample';
-import { insertExperiment, insertInference } from '../db';
+import { insertExperiment, insertInference, insertLossCurve, updateWeightsPath } from '../db';
+import { saveWeights } from '../weights';
 import { buildSystemPrompt, buildUserPrompt, type ExperimentRecord } from './prompt';
 
 export type ResearchCallbacks = {
@@ -90,8 +91,9 @@ export class ResearchController {
 			this.bestConfig = { ...config };
 		}
 
+		const expName = `Research #${this.history.length + 1}`;
 		const dbId = await insertExperiment({
-			name: `Research #${this.history.length + 1}`,
+			name: expName,
 			config,
 			valBpb: result.valBpb,
 			elapsed: result.elapsed,
@@ -101,28 +103,35 @@ export class ResearchController {
 			lossCurve
 		});
 
-		// Generate and save a sample inference
-		let generatedSample = '';
+		// Save loss curve to normalized table
+		await insertLossCurve(dbId, lossCurve);
+
+		// Save weights to OPFS
 		try {
-			generatedSample = await sampleText(result.params, config, '', 200, 0.8);
-			await insertInference({
-				experimentId: dbId,
-				prompt: '',
-				output: generatedSample,
-				temperature: 0.8
-			});
+			const weightsPath = await saveWeights(dbId, result.params);
+			await updateWeightsPath(dbId, weightsPath);
 		} catch (_) {}
+
+		// Generate sample in background — don't block next experiment
+		const bgParams = result.params;
+		const bgConfig = config;
+		(async () => {
+			try {
+				const output = await sampleText(bgParams, bgConfig, '', 200, 0.8);
+				await insertInference({ experimentId: dbId, prompt: '', output, temperature: 0.8 });
+			} catch (_) {}
+		})();
 
 		const record: ExperimentRecord = {
 			id: dbId,
-			name: `Research #${this.history.length + 1}`,
+			name: expName,
 			config,
 			valBpb: result.valBpb,
 			elapsed: result.elapsed,
 			totalSteps: result.totalSteps,
 			reasoning,
 			kept,
-			sampleText: generatedSample,
+			sampleText: '',
 			lossCurve
 		};
 
