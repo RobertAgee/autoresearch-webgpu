@@ -2,6 +2,7 @@ import type { ExperimentConfig } from '../model/config';
 
 export type ExperimentRecord = {
 	id: number;
+	name: string;
 	config: ExperimentConfig;
 	valBpb: number;
 	elapsed: number;

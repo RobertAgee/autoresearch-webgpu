@@ -35,7 +35,7 @@
 
 		<label class="flex items-center justify-between">
 			<span class="text-gray-400">activation</span>
-			<select bind:value={config.activation} {disabled} class="w-20 bg-gray-800 border border-gray-700 rounded px-1 py-0.5 text-right">
+			<select bind:value={config.activation} {disabled} class="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-right appearance-none cursor-pointer">
 				<option value="relu_sq">relu²</option>
 				<option value="gelu">gelu</option>
 				<option value="silu">silu</option>

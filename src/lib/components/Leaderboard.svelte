@@ -18,12 +18,13 @@
 	{#each sorted as exp, i}
 		<button
 			onclick={() => onSelect?.(exp)}
-			class="w-full flex items-center justify-between font-mono text-xs px-2 py-1 rounded transition-colors
+			class="w-full flex items-center justify-between gap-2 font-mono text-xs px-2 py-1.5 rounded transition-colors
 				{selected?.id === exp.id ? 'bg-blue-950/50 text-blue-300' : i === 0 ? 'bg-green-950/50 text-green-300' : 'text-gray-400 hover:bg-gray-800'}"
 		>
-			<span>#{exp.id}</span>
-			<span class="tabular-nums">{exp.valBpb.toFixed(4)}</span>
-			<span class="text-gray-500">{exp.totalSteps}st</span>
+			<span class="truncate text-left flex-1" title={exp.reasoning}>
+				{exp.name || `#${exp.id}`}
+			</span>
+			<span class="tabular-nums shrink-0">{exp.valBpb.toFixed(3)}</span>
 		</button>
 	{/each}
 

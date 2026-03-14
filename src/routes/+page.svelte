@@ -7,7 +7,11 @@
 	import { sampleText } from '$lib/sample';
 	import { ResearchController } from '$lib/research/controller';
 	import type { ExperimentRecord } from '$lib/research/prompt';
-	import { saveExperiment, loadExperiments, saveBestConfig, loadBestConfig, clearAll, exportAsJson } from '$lib/storage';
+	import {
+		getDb, insertExperiment, insertInference, getAllExperiments,
+		getBestExperiment, getInferencesForExperiment, clearAllData,
+		exportExperimentsJson, type ExperimentRow, type InferenceRow
+	} from '$lib/db';
 	import LossChart from '$lib/components/LossChart.svelte';
 	import ConfigEditor from '$lib/components/ConfigEditor.svelte';
 	import ResearchLog from '$lib/components/ResearchLog.svelte';
@@ -19,15 +23,20 @@
 	let lossData = $state<{ step: number; loss: number }[]>([]);
 	let status = $state('idle');
 	let result = $state<RunResult | null>(null);
-	let sample = $state('');
 	let sampling = $state(false);
 	let mode = $state<'manual' | 'research'>('manual');
 	let experiments = $state<ExperimentRecord[]>([]);
 	let currentReasoning = $state('');
+	let experimentName = $state('');
+	let experimentDesc = $state('');
+
+	// Inference state
 	let prompt = $state('');
 	let temperature = $state(0.8);
-	let selectedExperiment = $state<ExperimentRecord | null>(null);
-	let nextManualId = $state(1);
+	let selectedExpId = $state<number | null>(null);
+	let inferences = $state<InferenceRow[]>([]);
+	let inferenceIdx = $state(0);
+	let currentExpDbId = $state<number | null>(null);
 
 	let pastLossRuns = $derived(
 		experiments
@@ -43,6 +52,7 @@
 	let controller: ResearchController | null = null;
 
 	onMount(async () => {
+		await getDb();
 		gpuStatus = await initWebGPU();
 		if (gpuStatus.ok) {
 			status = 'loading data...';
@@ -50,20 +60,33 @@
 				DataLoader.fetch('/data/train.bin'),
 				DataLoader.fetch('/data/val.bin')
 			]);
-
-			const saved = await loadExperiments();
-			if (saved.length > 0) {
-				experiments = saved;
-				nextManualId = Math.max(...saved.map(e => e.id)) + 1;
-			}
-			const best = await loadBestConfig();
-			if (best) {
-				config = best.config;
-			}
-
+			await loadFromDb();
 			status = 'ready';
 		}
 	});
+
+	async function loadFromDb() {
+		const rows = await getAllExperiments();
+		experiments = rows.map(rowToRecord);
+		const best = await getBestExperiment();
+		if (best) {
+			config = best.config as ExperimentConfig;
+		}
+	}
+
+	function rowToRecord(row: ExperimentRow): ExperimentRecord {
+		return {
+			id: row.id,
+			name: row.name,
+			config: row.config as ExperimentConfig,
+			valBpb: row.val_bpb,
+			elapsed: row.elapsed,
+			totalSteps: row.total_steps,
+			reasoning: row.reasoning,
+			kept: row.kept,
+			lossCurve: row.loss_curve ?? undefined
+		};
+	}
 
 	async function startManualTraining() {
 		if (!trainLoader || !valLoader || running) return;
@@ -71,7 +94,8 @@
 		running = true;
 		lossData = [];
 		result = null;
-		sample = '';
+		inferences = [];
+		inferenceIdx = 0;
 		status = 'training...';
 		trainLoader.reset();
 
@@ -90,33 +114,30 @@
 			}
 		});
 
-		let generatedSample = '';
-		try {
-			status = 'generating sample...';
-			generatedSample = await sampleText(r.params, runConfig, '', 200, 0.8);
-		} catch (_) {}
+		const kept = experiments.length === 0 || r.valBpb < Math.min(...experiments.map(e => e.valBpb));
 
-		const id = nextManualId++;
-		const record: ExperimentRecord = {
-			id,
+		const dbId = await insertExperiment({
+			name: experimentName || `Run ${experiments.length + 1}`,
 			config: runConfig,
 			valBpb: r.valBpb,
 			elapsed: r.elapsed,
 			totalSteps: r.totalSteps,
-			reasoning: 'Manual training run',
-			kept: experiments.length === 0 || r.valBpb < Math.min(...experiments.map(e => e.valBpb)),
-			sampleText: generatedSample,
+			reasoning: experimentDesc || experimentName || 'Manual run',
+			kept,
 			lossCurve
-		};
+		});
 
-		experiments = [...experiments, record];
-		await saveExperiment(record);
-		selectedExperiment = record;
-		sample = generatedSample;
+		currentExpDbId = dbId;
 
-		if (record.kept) {
-			await saveBestConfig(runConfig, r.valBpb);
-		}
+		// Auto-generate a sample
+		status = 'generating sample...';
+		try {
+			const sampleOutput = await sampleText(r.params, runConfig, '', 200, 0.8);
+			await insertInference({ experimentId: dbId, prompt: '', output: sampleOutput, temperature: 0.8 });
+		} catch (_) {}
+
+		await loadFromDb();
+		await selectExperimentById(dbId);
 
 		status = `done — val_bpb: ${r.valBpb.toFixed(4)} | ${r.totalSteps} steps | ${(r.elapsed / 1000).toFixed(1)}s`;
 		running = false;
@@ -128,33 +149,28 @@
 		running = true;
 		controller = new ResearchController();
 
-		const best = await loadBestConfig();
+		const best = await getBestExperiment();
 		if (best) {
-			controller.bestConfig = best.config;
-			controller.bestBpb = best.bpb;
+			controller.bestConfig = best.config as ExperimentConfig;
+			controller.bestBpb = best.val_bpb;
 			controller.history = [...experiments];
 		}
-		controller.nextId = nextManualId;
 
 		await controller.run(trainLoader, valLoader, {
-			onExperimentStart(id, cfg, reasoning) {
+			onExperimentStart(cfg, reasoning) {
 				lossData = [];
 				currentReasoning = reasoning;
-				status = `experiment #${id}: ${reasoning}`;
+				status = `experiment: ${reasoning}`;
 			},
 			onStep(m: StepMetrics) {
 				lossData = [...lossData, { step: m.step, loss: m.loss }];
 			},
 			async onExperimentDone(record: ExperimentRecord) {
-				experiments = [...experiments, record];
-				nextManualId = record.id + 1;
-				await saveExperiment(record);
+				await loadFromDb();
+				await selectExperimentById(record.id);
 				if (record.kept && controller) {
-					await saveBestConfig(controller.bestConfig, controller.bestBpb);
 					config = { ...controller.bestConfig };
 				}
-				selectedExperiment = record;
-				sample = record.sampleText || '';
 				status = `#${record.id} ${record.kept ? 'KEPT' : 'discarded'} — bpb ${record.valBpb.toFixed(4)}`;
 			},
 			onError(error) {
@@ -169,30 +185,43 @@
 		controller?.stop();
 	}
 
-	async function generateSample() {
-		if (!result || sampling) return;
-		sampling = true;
-		sample = await sampleText(result.params, config, prompt, 200, temperature);
-		sampling = false;
+	async function selectExperimentById(id: number) {
+		selectedExpId = id;
+		inferences = await getInferencesForExperiment(id);
+		inferenceIdx = 0;
 	}
 
 	function selectExperiment(exp: ExperimentRecord) {
-		selectedExperiment = exp;
-		sample = exp.sampleText || '';
+		selectExperimentById(exp.id);
+	}
+
+	async function generateSample() {
+		if (!result || sampling || !currentExpDbId) return;
+		sampling = true;
+		try {
+			const output = await sampleText(result.params, config, prompt, 200, temperature);
+			await insertInference({ experimentId: currentExpDbId, prompt, output, temperature });
+			inferences = await getInferencesForExperiment(currentExpDbId);
+			inferenceIdx = 0;
+		} catch (e) {
+			console.error('Inference failed:', e);
+		}
+		sampling = false;
 	}
 
 	async function handleClear() {
 		if (!confirm('Clear all experiment history?')) return;
-		await clearAll();
+		await clearAllData();
 		experiments = [];
 		config = { ...DEFAULT_CONFIG };
-		selectedExperiment = null;
-		sample = '';
-		nextManualId = 1;
+		selectedExpId = null;
+		inferences = [];
+		currentExpDbId = null;
 	}
 
-	function handleExport() {
-		const blob = new Blob([exportAsJson(experiments)], { type: 'application/json' });
+	async function handleExport() {
+		const json = await exportExperimentsJson();
+		const blob = new Blob([json], { type: 'application/json' });
 		const url = URL.createObjectURL(blob);
 		const a = document.createElement('a');
 		a.href = url;
@@ -200,6 +229,8 @@
 		a.click();
 		URL.revokeObjectURL(url);
 	}
+
+	let currentInference = $derived(inferences.length > 0 ? inferences[inferenceIdx] : null);
 </script>
 
 <svelte:head>
@@ -253,6 +284,20 @@
 				</div>
 
 				{#if mode === 'manual'}
+					<input
+						type="text"
+						bind:value={experimentName}
+						placeholder="experiment name..."
+						disabled={running}
+						class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 font-mono text-sm text-gray-200 placeholder-gray-500 disabled:opacity-40"
+					/>
+					<textarea
+						bind:value={experimentDesc}
+						placeholder="description / hypothesis..."
+						disabled={running}
+						rows={2}
+						class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40 resize-none"
+					></textarea>
 					<button
 						onclick={startManualTraining}
 						disabled={running || status === 'loading data...'}
@@ -280,17 +325,74 @@
 				{/if}
 			</div>
 
-			<!-- Center: chart + status + research log -->
+			<!-- Center: chart + status + inference (all in one panel) -->
 			<div class="space-y-4">
-				<div class="rounded border border-gray-800 p-4">
-					<h2 class="text-sm font-mono text-gray-400 mb-2">loss</h2>
+				<div class="rounded border border-gray-800 p-4 space-y-4">
+					<h2 class="text-sm font-mono text-gray-400">loss</h2>
 					<div class="h-48">
 						<LossChart data={lossData} pastRuns={pastLossRuns} />
 					</div>
-				</div>
 
-				<div class="rounded border border-gray-800 p-3 font-mono text-sm text-gray-300">
-					{status}
+					<div class="font-mono text-sm text-gray-300">
+						{status}
+					</div>
+
+					<!-- Inference inline -->
+					<div class="border-t border-gray-800 pt-3 space-y-2">
+						<div class="flex items-center gap-2">
+							<input
+								type="text"
+								bind:value={prompt}
+								placeholder="prompt..."
+								disabled={!result || sampling}
+								class="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40"
+								onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter') generateSample(); }}
+							/>
+							<input
+								type="number"
+								bind:value={temperature}
+								min={0.1}
+								max={2}
+								step={0.1}
+								disabled={!result || sampling}
+								class="w-12 bg-gray-800 border border-gray-700 rounded px-1 py-1 text-right tabular-nums text-xs text-gray-200 font-mono disabled:opacity-40"
+								title="temperature"
+							/>
+							<button
+								onclick={generateSample}
+								disabled={!result || sampling}
+								class="rounded bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 px-2 py-1 font-mono text-xs transition-colors"
+							>
+								{sampling ? '...' : 'go'}
+							</button>
+						</div>
+						{#if currentInference}
+							<div class="flex items-center justify-between text-xs font-mono text-gray-500">
+								<span>
+									{#if currentInference.prompt}"{currentInference.prompt}"{:else}(empty prompt){/if}
+									· t={currentInference.temperature}
+								</span>
+								{#if inferences.length > 1}
+									<div class="flex items-center gap-1">
+										<button
+											onclick={() => { inferenceIdx = Math.min(inferenceIdx + 1, inferences.length - 1); }}
+											disabled={inferenceIdx >= inferences.length - 1}
+											class="px-1 hover:text-gray-300 disabled:opacity-30"
+										>←</button>
+										<span>{inferences.length - inferenceIdx}/{inferences.length}</span>
+										<button
+											onclick={() => { inferenceIdx = Math.max(inferenceIdx - 1, 0); }}
+											disabled={inferenceIdx <= 0}
+											class="px-1 hover:text-gray-300 disabled:opacity-30"
+										>→</button>
+									</div>
+								{/if}
+							</div>
+							<pre class="text-xs text-gray-300 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-48 overflow-y-auto">{currentInference.output}</pre>
+						{:else if !result}
+							<p class="text-gray-500 text-xs font-mono">train a model to generate text</p>
+						{/if}
+					</div>
 				</div>
 
 				{#if mode === 'research' && experiments.length > 0}
@@ -301,39 +403,11 @@
 				{/if}
 			</div>
 
-			<!-- Right: leaderboard + inference -->
+			<!-- Right: leaderboard -->
 			<div class="space-y-4">
 				<div class="rounded border border-gray-800 p-4">
 					<h2 class="text-sm font-mono text-gray-400 mb-3">leaderboard</h2>
-					<Leaderboard {experiments} onSelect={selectExperiment} selected={selectedExperiment} />
-				</div>
-
-				<div class="rounded border border-gray-800 p-4 space-y-3">
-					<h2 class="text-sm font-mono text-gray-400">inference</h2>
-					{#if result}
-						<div class="flex gap-2">
-							<input
-								type="text"
-								bind:value={prompt}
-								placeholder="prompt..."
-								class="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-xs text-gray-200 placeholder-gray-500"
-								onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter') generateSample(); }}
-							/>
-							<input type="number" bind:value={temperature} min={0.1} max={2} step={0.1} class="w-12 bg-gray-800 border border-gray-700 rounded px-1 py-1 text-right tabular-nums text-xs text-gray-200 font-mono" title="temperature" />
-							<button
-								onclick={generateSample}
-								disabled={sampling}
-								class="rounded bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 px-2 py-1 font-mono text-xs transition-colors"
-							>
-								{sampling ? '...' : 'go'}
-							</button>
-						</div>
-					{:else}
-						<p class="text-gray-500 text-xs font-mono">train a model first</p>
-					{/if}
-					{#if sample}
-						<pre class="text-xs text-gray-300 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-64 overflow-y-auto">{sample}</pre>
-					{/if}
+					<Leaderboard {experiments} onSelect={selectExperiment} selected={selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null} />
 				</div>
 			</div>
 		</div>

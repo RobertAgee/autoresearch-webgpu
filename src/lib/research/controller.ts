@@ -3,10 +3,11 @@ import { DEFAULT_CONFIG } from '../model/config';
 import { DataLoader } from '../data/loader';
 import { trainRun, type StepMetrics, type RunResult } from '../train/loop';
 import { sampleText } from '../sample';
+import { insertExperiment, insertInference } from '../db';
 import { buildSystemPrompt, buildUserPrompt, type ExperimentRecord } from './prompt';
 
 export type ResearchCallbacks = {
-	onExperimentStart?: (id: number, config: ExperimentConfig, reasoning: string) => void;
+	onExperimentStart?: (config: ExperimentConfig, reasoning: string) => void;
 	onStep?: (metrics: StepMetrics) => void;
 	onExperimentDone?: (record: ExperimentRecord) => void;
 	onError?: (error: string) => void;
@@ -17,8 +18,6 @@ export class ResearchController {
 	bestConfig: ExperimentConfig;
 	bestBpb: number = Infinity;
 	running: boolean = false;
-
-	nextId = 1;
 	lastError = '';
 	private stopRequested = false;
 
@@ -38,7 +37,6 @@ export class ResearchController {
 		this.running = true;
 		this.stopRequested = false;
 
-		// Run first experiment with defaults if no history
 		if (this.history.length === 0) {
 			await this.runExperiment(
 				this.bestConfig,
@@ -75,8 +73,7 @@ export class ResearchController {
 		valData: DataLoader,
 		callbacks: ResearchCallbacks
 	) {
-		const id = this.nextId++;
-		callbacks.onExperimentStart?.(id, config, reasoning);
+		callbacks.onExperimentStart?.(config, reasoning);
 
 		trainData.reset();
 		const lossCurve: { step: number; loss: number }[] = [];
@@ -93,13 +90,32 @@ export class ResearchController {
 			this.bestConfig = { ...config };
 		}
 
+		const dbId = await insertExperiment({
+			name: `Research #${this.history.length + 1}`,
+			config,
+			valBpb: result.valBpb,
+			elapsed: result.elapsed,
+			totalSteps: result.totalSteps,
+			reasoning,
+			kept,
+			lossCurve
+		});
+
+		// Generate and save a sample inference
 		let generatedSample = '';
 		try {
 			generatedSample = await sampleText(result.params, config, '', 200, 0.8);
+			await insertInference({
+				experimentId: dbId,
+				prompt: '',
+				output: generatedSample,
+				temperature: 0.8
+			});
 		} catch (_) {}
 
 		const record: ExperimentRecord = {
-			id,
+			id: dbId,
+			name: `Research #${this.history.length + 1}`,
 			config,
 			valBpb: result.valBpb,
 			elapsed: result.elapsed,
