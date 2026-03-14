@@ -4,22 +4,33 @@
 	let {
 		experiments,
 		onSelect,
-		selected
+		selected,
+		sortByLoss = true
 	}: {
 		experiments: ExperimentRecord[];
 		onSelect?: (exp: ExperimentRecord) => void;
 		selected?: ExperimentRecord | null;
+		sortByLoss?: boolean;
 	} = $props();
 
-	let sorted = $derived([...experiments].sort((a, b) => a.valBpb - b.valBpb).slice(0, 10));
+	let sorted = $derived(
+		sortByLoss
+			? [...experiments].sort((a, b) => a.valBpb - b.valBpb)
+			: [...experiments].reverse()
+	);
+	let bestId = $derived(
+		experiments.length > 0
+			? [...experiments].sort((a, b) => a.valBpb - b.valBpb)[0].id
+			: null
+	);
 </script>
 
-<div class="space-y-1">
+<div class="space-y-0.5 overflow-y-auto">
 	{#each sorted as exp, i}
 		<button
 			onclick={() => onSelect?.(exp)}
-			class="w-full flex items-center gap-2 font-mono text-xs px-2 py-1.5 rounded transition-colors
-				{selected?.id === exp.id ? 'bg-blue-950/50 text-blue-300' : i === 0 ? 'bg-green-950/50 text-green-300' : 'text-gray-400 hover:bg-gray-800'}"
+			class="w-full flex items-center gap-1.5 font-mono text-[11px] px-1.5 py-1 rounded transition-colors
+				{selected?.id === exp.id ? 'bg-blue-950/50 text-blue-300' : exp.id === bestId ? 'bg-green-950/50 text-green-300' : 'text-gray-400 hover:bg-gray-800'}"
 		>
 			<span class="shrink-0 w-3 text-center {exp.source === 'auto' ? 'text-blue-400' : 'text-gray-500'}" title={exp.source === 'auto' ? 'auto (Claude)' : 'manual'}>
 				{exp.source === 'auto' ? 'A' : 'M'}

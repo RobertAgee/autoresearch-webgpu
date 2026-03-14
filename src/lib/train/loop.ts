@@ -23,6 +23,7 @@ export type RunResult = {
 export type TrainCallbacks = {
 	onStep?: (metrics: StepMetrics) => void;
 	onDone?: (result: RunResult) => void;
+	signal?: AbortSignal;
 };
 
 function yieldToUI(): Promise<void> {
@@ -57,7 +58,7 @@ export async function trainRun(
 	let lastLoss = 0;
 	const t0 = performance.now();
 
-	while (elapsed < config.trainSeconds * 1000) {
+	while (elapsed < config.trainSeconds * 1000 && !callbacks.signal?.aborted) {
 		const stepStart = performance.now();
 
 		const batch = trainData.nextBatch(config.batchSize, config.seqLen);

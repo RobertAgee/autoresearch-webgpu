@@ -1,4 +1,4 @@
-import type { ExperimentConfig } from '../model/config';
+import type { ExperimentConfig, ParamConstraints } from '../model/config';
 import { DEFAULT_CONFIG } from '../model/config';
 import { DataLoader } from '../data/loader';
 import { trainRun, type StepMetrics, type RunResult } from '../train/loop';
@@ -20,7 +20,9 @@ export class ResearchController {
 	bestBpb: number = Infinity;
 	running: boolean = false;
 	lastError = '';
+	constraints?: ParamConstraints;
 	private stopRequested = false;
+	private runAbort: AbortController | null = null;
 
 	constructor() {
 		this.bestConfig = { ...DEFAULT_CONFIG };
@@ -28,6 +30,10 @@ export class ResearchController {
 
 	stop() {
 		this.stopRequested = true;
+	}
+
+	stopCurrentRun() {
+		this.runAbort?.abort();
 	}
 
 	async run(
@@ -77,13 +83,16 @@ export class ResearchController {
 		callbacks.onExperimentStart?.(config, reasoning);
 
 		trainData.reset();
+		this.runAbort = new AbortController();
 		const lossCurve: { step: number; loss: number }[] = [];
 		const result = await trainRun(config, trainData, valData, {
+			signal: this.runAbort.signal,
 			onStep(m) {
 				lossCurve.push({ step: m.step, loss: m.loss });
 				callbacks.onStep?.(m);
 			}
 		});
+		this.runAbort = null;
 
 		const kept = result.valBpb < this.bestBpb;
 		if (kept) {
@@ -143,7 +152,7 @@ export class ResearchController {
 
 	private async getNextConfig(): Promise<{ config: ExperimentConfig; reasoning: string } | null> {
 		const systemPrompt = buildSystemPrompt();
-		const userPrompt = buildUserPrompt(this.history, this.bestConfig, this.bestBpb);
+		const userPrompt = buildUserPrompt(this.history, this.bestConfig, this.bestBpb, this.constraints);
 
 		try {
 			const response = await fetch('/api/research', {

@@ -27,6 +27,26 @@ export type ExperimentConfig = {
 	vocabSize: number;
 };
 
+export type Range = { min?: number; max?: number };
+
+export type ParamConstraints = {
+	[K in keyof ExperimentConfig]?: Range;
+} & {
+	maxParams?: Range;
+};
+
+export const DEFAULT_CONSTRAINTS: ParamConstraints = {
+	nLayer: { min: 1, max: 8 },
+	nEmbd: { min: 32, max: 256 },
+	nHead: { min: 1, max: 8 },
+	mlpRatio: { min: 2, max: 6 },
+	batchSize: { min: 4, max: 32 },
+	seqLen: { min: 64, max: 256 },
+	lr: { min: 0.00001, max: 0.01 },
+	trainSeconds: { max: 30 },
+	maxParams: { max: 3_000_000 },
+};
+
 /** Sensible defaults loaded from static/defaults.json */
 export const DEFAULT_CONFIG: ExperimentConfig = defaults as ExperimentConfig;
 

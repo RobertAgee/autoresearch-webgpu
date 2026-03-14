@@ -1,4 +1,4 @@
-import type { ExperimentConfig } from '../model/config';
+import type { ExperimentConfig, ParamConstraints } from '../model/config';
 
 export type ExperimentRecord = {
 	id: number;
@@ -60,10 +60,24 @@ Strategy tips:
 export function buildUserPrompt(
 	history: ExperimentRecord[],
 	bestConfig: ExperimentConfig,
-	bestBpb: number
+	bestBpb: number,
+	constraints?: ParamConstraints
 ): string {
 	let msg = `Current best config (val_bpb = ${bestBpb.toFixed(4)}):\n`;
 	msg += '```json\n' + JSON.stringify(bestConfig, null, 2) + '\n```\n\n';
+
+	if (constraints) {
+		const lines: string[] = [];
+		for (const [key, c] of Object.entries(constraints)) {
+			if (!c) continue;
+			if (c.min != null && c.max != null) lines.push(`  ${key}: ${c.min} to ${c.max}`);
+			else if (c.min != null) lines.push(`  ${key}: >= ${c.min}`);
+			else if (c.max != null) lines.push(`  ${key}: <= ${c.max}`);
+		}
+		if (lines.length > 0) {
+			msg += 'HARD CONSTRAINTS (you must respect these):\n' + lines.join('\n') + '\n\n';
+		}
+	}
 
 	if (history.length > 0) {
 		msg += 'Experiment history (most recent first):\n';

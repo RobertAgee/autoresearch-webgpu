@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { initWebGPU, type WebGPUStatus } from '$lib/webgpu';
-	import { DEFAULT_CONFIG, type ExperimentConfig } from '$lib/model/config';
+	import { DEFAULT_CONFIG, DEFAULT_CONSTRAINTS, type ExperimentConfig, type ParamConstraints } from '$lib/model/config';
 	import { DataLoader } from '$lib/data/loader';
 	import { trainRun, type StepMetrics, type RunResult } from '$lib/train/loop';
 	import { sampleText } from '$lib/sample';
@@ -16,9 +16,9 @@
 	import { saveWeights, loadWeights } from '$lib/weights';
 	import LossChart from '$lib/components/LossChart.svelte';
 	import ConfigEditor from '$lib/components/ConfigEditor.svelte';
-	import ResearchLog from '$lib/components/ResearchLog.svelte';
 	import Leaderboard from '$lib/components/Leaderboard.svelte';
 	import ConfigDiff from '$lib/components/ConfigDiff.svelte';
+	import ConstraintsModal from '$lib/components/ConstraintsModal.svelte';
 
 	let gpuStatus = $state<WebGPUStatus | null>(null);
 	let config = $state<ExperimentConfig>({ ...DEFAULT_CONFIG });
@@ -32,6 +32,7 @@
 	let currentReasoning = $state('');
 	let experimentName = $state('');
 	let experimentDesc = $state('');
+	let listMode = $state<'leaderboard' | 'log'>('leaderboard');
 
 	// Inference state
 	let prompt = $state('');
@@ -40,6 +41,9 @@
 	let inferences = $state<InferenceRow[]>([]);
 	let inferenceIdx = $state(0);
 	let currentExpDbId = $state<number | null>(null);
+	let viewingLiveRun = $state(true);
+	let currentRunName = $state('');
+	let trainAbort: AbortController | null = null;
 
 	let pastLossRuns = $derived(
 		experiments
@@ -65,13 +69,16 @@
 				DataLoader.fetch('/data/val.bin')
 			]);
 			await loadFromDb();
-			// Restore selection from URL
-			const expParam = new URL(window.location.href).searchParams.get('exp');
+			// Restore state from URL
+			const params = new URL(window.location.href).searchParams;
+			const expParam = params.get('exp');
 			if (expParam) {
 				const id = Number(expParam);
 				const exp = experiments.find(e => e.id === id);
 				if (exp) selectExperiment(exp);
 			}
+			const viewParam = params.get('view');
+			if (viewParam === 'log' || viewParam === 'leaderboard') listMode = viewParam;
 			status = 'ready';
 		}
 	});
@@ -116,11 +123,13 @@
 		inferenceIdx = 0;
 		status = 'training...';
 		trainLoader.reset();
+		trainAbort = new AbortController();
 
 		const runConfig = { ...config };
 		const lossCurve: { step: number; loss: number }[] = [];
 
 		const r = await trainRun(runConfig, trainLoader, valLoader, {
+			signal: trainAbort.signal,
 			onStep(m: StepMetrics) {
 				lossData = [...lossData, { step: m.step, loss: m.loss }];
 				lossCurve.push({ step: m.step, loss: m.loss });
@@ -131,6 +140,7 @@
 				status = `done — val_bpb: ${r.valBpb.toFixed(4)} | ${r.totalSteps} steps | ${(r.elapsed / 1000).toFixed(1)}s`;
 			}
 		});
+		trainAbort = null;
 
 		const kept = experiments.length === 0 || r.valBpb < Math.min(...experiments.map(e => e.valBpb));
 
@@ -181,6 +191,7 @@
 
 		running = true;
 		controller = new ResearchController();
+		controller.constraints = constraints;
 
 		const best = await getBestExperiment();
 		if (best) {
@@ -218,6 +229,11 @@
 		controller?.stop();
 	}
 
+	function stopCurrentRun() {
+		trainAbort?.abort();
+		controller?.stopCurrentRun();
+	}
+
 	function setSelectedExp(id: number | null) {
 		selectedExpId = id;
 		const url = new URL(window.location.href);
@@ -226,6 +242,13 @@
 		} else {
 			url.searchParams.delete('exp');
 		}
+		history.replaceState(null, '', url);
+	}
+
+	function setListMode(m: 'leaderboard' | 'log') {
+		listMode = m;
+		const url = new URL(window.location.href);
+		url.searchParams.set('view', m);
 		history.replaceState(null, '', url);
 	}
 
@@ -276,7 +299,9 @@
 	}
 
 	let showClearModal = $state(false);
-	let maxParams = $state(200_000_000);
+	let showConstraints = $state(false);
+	let constraints = $state<ParamConstraints>({ ...DEFAULT_CONSTRAINTS });
+	let maxParams = $state(400_000_000);
 
 	async function handleClear() {
 		showClearModal = true;
@@ -332,7 +357,7 @@
 	<title>autoresearch-webgpu</title>
 </svelte:head>
 
-<main class="p-6 max-w-6xl mx-auto space-y-6">
+<main class="px-6 py-4 max-w-6xl mx-auto space-y-4">
 	{#if gpuStatus === null}
 		<p class="text-gray-400 font-mono text-sm">initializing webgpu...</p>
 	{:else if !gpuStatus.ok}
@@ -346,42 +371,40 @@
 				Based on Andrej Karpathy's <a href="https://github.com/karpathy/autoresearch" class="underline hover:text-gray-300">autoresearch</a> and built on Eric Zhang's <a href="https://github.com/ekzhang/jax-js" class="underline hover:text-gray-300">jax-js</a>. Built by <a href="https://lucasgelfond.online" class="underline hover:text-gray-300">Lucas Gelfond</a>, in New York, with love.
 			</p>
 		</div>
-		<div class="flex items-center gap-4">
-			<div class="flex rounded border border-gray-700 text-sm font-mono overflow-hidden">
+		<div class="flex items-center gap-3">
+			<div class="flex rounded border border-gray-700 text-xs font-mono overflow-hidden">
 				<button
-					class="px-3 py-1 {mode === 'manual' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}"
+					class="px-2.5 py-0.5 {mode === 'manual' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}"
 					onclick={() => (mode = 'manual')}
 					disabled={running}
 				>
 					manual
 				</button>
 				<button
-					class="px-3 py-1 {mode === 'research' ? 'bg-blue-700 text-white' : 'text-gray-400 hover:text-white'}"
+					class="px-2.5 py-0.5 {mode === 'research' ? 'bg-blue-700 text-white' : 'text-gray-400 hover:text-white'}"
 					onclick={() => (mode = 'research')}
 					disabled={running}
 				>
 					auto
 				</button>
 			</div>
-			<span class="text-gray-500 text-xs font-mono">
-				{experiments.length} experiments
-			</span>
-			{#if experiments.length > 0}
-				<button onclick={handleExport} class="text-gray-500 hover:text-gray-300 text-xs font-mono">
-					export
-				</button>
-				<button onclick={handleClear} disabled={running} class="text-gray-500 hover:text-red-400 text-xs font-mono">
-					clear
-				</button>
-			{/if}
+			<button
+				onclick={() => (showConstraints = true)}
+				class="text-gray-400 hover:text-white p-1"
+				title="set constraints"
+			>
+				<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4">
+					<path fill-rule="evenodd" d="M7.84 1.804A1 1 0 0 1 8.82 1h2.36a1 1 0 0 1 .98.804l.331 1.652a6.993 6.993 0 0 1 1.929 1.115l1.598-.54a1 1 0 0 1 1.186.447l1.18 2.044a1 1 0 0 1-.205 1.251l-1.267 1.113a7.047 7.047 0 0 1 0 2.228l1.267 1.113a1 1 0 0 1 .206 1.25l-1.18 2.045a1 1 0 0 1-1.187.447l-1.598-.54a6.993 6.993 0 0 1-1.929 1.115l-.33 1.652a1 1 0 0 1-.98.804H8.82a1 1 0 0 1-.98-.804l-.331-1.652a6.993 6.993 0 0 1-1.929-1.115l-1.598.54a1 1 0 0 1-1.186-.447l-1.18-2.044a1 1 0 0 1 .205-1.251l1.267-1.114a7.05 7.05 0 0 1 0-2.227L1.821 7.773a1 1 0 0 1-.206-1.25l1.18-2.045a1 1 0 0 1 1.187-.447l1.598.54A6.992 6.992 0 0 1 7.51 3.456l.33-1.652ZM10 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" clip-rule="evenodd" />
+				</svg>
+			</button>
 		</div>
 
-		<div class="grid grid-cols-[280px_1fr_280px] gap-6">
+		<div class="grid grid-cols-[240px_1fr_240px] gap-4 h-[calc(100vh-11rem)]">
 			<!-- Left: config + controls -->
-			<div class="space-y-4">
-				<div class="rounded border border-gray-800 p-4">
-					<h2 class="text-sm font-mono text-gray-400 mb-3">config</h2>
-					<ConfigEditor bind:config disabled={running || viewingExisting} />
+			<div class="space-y-2 overflow-y-auto h-full">
+				<div class="rounded border border-gray-800 p-3">
+					<h2 class="text-xs font-mono text-gray-400 mb-2">config</h2>
+					<ConfigEditor bind:config disabled={running || viewingExisting} {constraints} />
 				</div>
 
 				{#if paramCapExceeded}
@@ -394,7 +417,7 @@
 					{#if viewingExisting && selectedExp}
 						<button
 							onclick={forkFromSelected}
-							class="w-full rounded bg-gray-700 hover:bg-gray-600 px-4 py-2 font-mono text-sm text-gray-200 transition-colors"
+							class="w-full rounded bg-gray-700 hover:bg-gray-600 px-3 py-2 font-mono text-xs text-gray-200 transition-colors"
 						>
 							create new config from existing
 						</button>
@@ -404,49 +427,66 @@
 							bind:value={experimentName}
 							placeholder="experiment name..."
 							disabled={running}
-							class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 font-mono text-sm text-gray-200 placeholder-gray-500 disabled:opacity-40"
+							class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40"
 						/>
 						<textarea
 							bind:value={experimentDesc}
 							placeholder="description / hypothesis..."
 							disabled={running}
 							rows={2}
-							class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40 resize-none"
+							class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-[11px] text-gray-200 placeholder-gray-500 disabled:opacity-40 resize-none"
 						></textarea>
-						<button
-							onclick={startManualTraining}
-							disabled={running || status === 'loading data...' || paramCapExceeded}
-							class="w-full rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-4 py-2 font-mono text-sm transition-colors"
-						>
-							{running ? 'training...' : 'start training'}
-						</button>
+						{#if running}
+							<button
+								onclick={stopCurrentRun}
+								class="w-full rounded bg-red-600 hover:bg-red-500 px-3 py-1.5 font-mono text-xs transition-colors"
+							>
+								stop training
+							</button>
+						{:else}
+							<button
+								onclick={startManualTraining}
+								disabled={status === 'loading data...' || paramCapExceeded}
+								class="w-full rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors"
+							>
+								start training
+							</button>
+						{/if}
 					{/if}
 				{:else}
 					{#if !running}
 						<button
 							onclick={startResearch}
 							disabled={status === 'loading data...'}
-							class="w-full rounded bg-green-600 hover:bg-green-500 disabled:bg-gray-700 disabled:text-gray-500 px-4 py-2 font-mono text-sm transition-colors"
+							class="w-full rounded bg-green-600 hover:bg-green-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors"
 						>
 							start research
 						</button>
 					{:else}
-						<button
-							onclick={stopResearch}
-							class="w-full rounded bg-red-600 hover:bg-red-500 px-4 py-2 font-mono text-sm transition-colors"
-						>
-							stop after current run
-						</button>
+						<div class="space-y-1.5">
+							<button
+								onclick={stopCurrentRun}
+								class="w-full rounded bg-red-600 hover:bg-red-500 px-3 py-1.5 font-mono text-xs transition-colors"
+							>
+								stop current run
+							</button>
+							<button
+								onclick={stopResearch}
+								class="w-full rounded bg-gray-700 hover:bg-gray-600 px-3 py-1.5 font-mono text-xs text-gray-200 transition-colors"
+							>
+								stop after current run
+							</button>
+						</div>
 					{/if}
 				{/if}
 			</div>
 
-			<!-- Center: chart + status + inference (all in one panel) -->
-			<div class="space-y-4">
-				<div class="rounded border border-gray-800 p-4 space-y-4">
+			<!-- Center: chart + status + inference -->
+			<div class="flex flex-col h-full overflow-hidden">
+				<div class="rounded border border-gray-800 p-3 space-y-2 flex-1 overflow-y-auto">
 					{#if selectedExp}
-						<div class="flex items-center gap-2 font-mono text-sm">
-							<span class="px-1.5 py-0.5 rounded text-xs {selectedExp.source === 'auto' ? 'bg-blue-900/50 text-blue-300' : 'bg-gray-700 text-gray-300'}">
+						<div class="flex items-center gap-2 font-mono text-xs">
+							<span class="px-1 py-0.5 rounded text-[10px] {selectedExp.source === 'auto' ? 'bg-blue-900/50 text-blue-300' : 'bg-gray-700 text-gray-300'}">
 								{selectedExp.source === 'auto' ? 'auto' : 'manual'}
 							</span>
 							<span class="text-gray-200">{selectedExp.name}</span>
@@ -456,18 +496,18 @@
 							<ConfigDiff before={prevExpConfig} after={selectedExp.config} />
 						{/if}
 						{#if selectedExp.reasoning && selectedExp.reasoning !== selectedExp.name}
-							<p class="text-xs text-gray-400 font-mono">{selectedExp.reasoning}</p>
+							<p class="text-[11px] text-gray-400 font-mono line-clamp-2" title={selectedExp.reasoning}>{selectedExp.reasoning}</p>
 						{/if}
 					{:else}
-						<h2 class="text-sm font-mono text-gray-400">loss</h2>
+						<h2 class="text-xs font-mono text-gray-400">loss</h2>
 					{/if}
-					<div class="h-48">
+					<div class="h-56">
 						<LossChart data={lossData} pastRuns={pastLossRuns} />
 					</div>
 
 					<!-- Inference -->
-					<div class="border-t border-gray-800 pt-3 space-y-2">
-						<h2 class="text-sm font-mono text-gray-400">inference</h2>
+					<div class="border-t border-gray-800 pt-2 space-y-1.5">
+						<h2 class="text-xs font-mono text-gray-400">inference</h2>
 						<div class="flex items-center gap-2">
 							<input
 								type="text"
@@ -526,14 +566,43 @@
 
 				</div>
 
-			<!-- Right: leaderboard -->
-			<div class="space-y-4">
-				<div class="rounded border border-gray-800 p-4">
-					<h2 class="text-sm font-mono text-gray-400 mb-3">leaderboard</h2>
-					<Leaderboard {experiments} onSelect={selectExperiment} selected={selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null} />
+			<!-- Right: leaderboard / research log -->
+			<div class="flex flex-col h-full overflow-hidden">
+				<div class="rounded border border-gray-800 p-3 flex flex-col flex-1 min-h-0">
+					<div class="flex items-center justify-between mb-2 shrink-0">
+						<div class="flex items-center gap-1 text-xs font-mono">
+							<button
+								class="{listMode === 'leaderboard' ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}"
+								onclick={() => setListMode('leaderboard')}
+							>leaderboard</button>
+							<span class="text-gray-600">/</span>
+							<button
+								class="{listMode === 'log' ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}"
+								onclick={() => setListMode('log')}
+							>log</button>
+						</div>
+						<span class="text-gray-500 text-[10px] font-mono">{experiments.length}</span>
+					</div>
+					<div class="flex-1 min-h-0 overflow-y-auto">
+						<Leaderboard {experiments} onSelect={selectExperiment} selected={selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null} sortByLoss={listMode === 'leaderboard'} />
+					</div>
+					{#if experiments.length > 0}
+						<div class="flex gap-3 mt-2 pt-2 border-t border-gray-800 shrink-0">
+							<button onclick={handleExport} class="text-gray-500 hover:text-gray-300 text-xs font-mono">
+								export
+							</button>
+							<button onclick={handleClear} disabled={running} class="text-gray-500 hover:text-red-400 text-xs font-mono">
+								clear
+							</button>
+						</div>
+					{/if}
 				</div>
 			</div>
 		</div>
+	{/if}
+
+	{#if showConstraints}
+		<ConstraintsModal bind:constraints onClose={() => (showConstraints = false)} />
 	{/if}
 
 	{#if showClearModal}
