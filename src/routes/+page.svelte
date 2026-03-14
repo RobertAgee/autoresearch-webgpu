@@ -433,11 +433,11 @@
 		</div>
 	{:else}
 		<div class="max-w-xl space-y-3">
-			<h1 class="text-lg font-mono text-gray-200">autoresearch-webgpu</h1>
-			<p class="text-[11px] font-mono text-gray-500 leading-relaxed">
-				Based on Andrej Karpathy's <a href="https://github.com/karpathy/autoresearch" class="underline hover:text-gray-300">autoresearch</a> and built on Eric Zhang's <a href="https://github.com/ekzhang/jax-js" class="underline hover:text-gray-300">jax-js</a>. Built by <a href="https://lucasgelfond.online" class="underline hover:text-gray-300">Lucas Gelfond</a>. Source <a href="https://github.com/lucasgelfond/autoresearch-webgpu" class="underline hover:text-gray-300">here</a>.
+			<h1 class="text-lg font-mono font-bold text-white">autoresearch-webgpu</h1>
+			<p class="text-xs font-mono text-gray-300 leading-relaxed">
+				Based on Andrej Karpathy's <a href="https://github.com/karpathy/autoresearch" class="underline hover:text-gray-200">autoresearch</a> and built on Eric Zhang's <a href="https://github.com/ekzhang/jax-js" class="underline hover:text-gray-200">jax-js</a>. Built by <a href="https://lucasgelfond.online" class="underline hover:text-gray-200">Lucas Gelfond</a>. Source <a href="https://github.com/lucasgelfond/autoresearch-webgpu" class="underline hover:text-gray-200">here</a>.
 			</p>
-			<p class="text-[11px] font-mono text-gray-600 leading-relaxed">
+			<p class="text-[10px] font-mono text-gray-500 leading-relaxed">
 				This playground trains small language models inside of your browser. Part of this process involves tuning <a href="https://en.wikipedia.org/wiki/Hyperparameter_(machine_learning)" target="_blank" rel="noopener noreferrer" class="decoration-dotted underline underline-offset-2 decoration-gray-500 hover:text-gray-400 hover:decoration-gray-400">"hyperparameters,"</a> model training settings. You can set these manually, or use Claude to set them — a model training another model! Lower loss = better.
 			</p>
 		</div>
