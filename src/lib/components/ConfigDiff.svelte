@@ -17,7 +17,7 @@
 </script>
 
 {#if diffs.length === 0}
-	<span class="text-gray-500 text-xs">no changes</span>
+	<span class="text-xs text-gray-500 py-0.5">no changes</span>
 {:else}
 	<div class="flex flex-wrap gap-1">
 		{#each diffs as d}

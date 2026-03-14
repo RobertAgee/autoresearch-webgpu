@@ -42,6 +42,7 @@
 	let inferences = $state<InferenceRow[]>([]);
 	let inferenceIdx = $state(0);
 	let currentExpDbId = $state<number | null>(null);
+	let streamingOutput = $state('');
 	let viewingLiveRun = $state(true);
 	let currentRunName = $state('');
 	let trainAbort: AbortController | null = null;
@@ -348,8 +349,12 @@
 				sampling = false;
 				return;
 			}
-			const output = await sampleText(params, expConfig, prompt, 200, temperature);
+			streamingOutput = '';
+			const output = await sampleText(params, expConfig, prompt, 200, temperature, (text) => {
+				streamingOutput = text;
+			});
 			await insertInference({ experimentId: selectedExpId, prompt, output, temperature });
+			streamingOutput = '';
 			inferences = await getInferencesForExperiment(selectedExpId);
 			inferenceIdx = 0;
 		} catch (e) {
@@ -544,7 +549,7 @@
 
 			<!-- Center: chart + status + inference -->
 			<div class="flex flex-col md:h-full md:overflow-hidden">
-				<div class="rounded border border-gray-800 p-3 space-y-2 flex-1 overflow-y-auto">
+				<div class="rounded border border-gray-800 p-3 space-y-2 flex-1 flex flex-col overflow-hidden">
 					{#if selectedExp}
 						<div class="flex items-center gap-2 font-mono text-xs">
 							<span class="px-1 py-0.5 rounded text-[10px] {selectedExp.source === 'auto' ? 'bg-blue-900/50 text-blue-300' : 'bg-gray-700 text-gray-300'}">
@@ -575,14 +580,14 @@
 					{:else}
 						<h2 class="text-xs font-mono text-gray-400">loss</h2>
 					{/if}
-					<div class="h-44">
+					<div class="h-44 shrink-0">
 						<LossChart data={lossData} pastRuns={pastLossRuns} />
 					</div>
 
 					<!-- Inference -->
-					<div class="border-t border-gray-800 pt-2 space-y-1.5">
-						<h2 class="text-xs font-mono text-gray-400">test current model / inference</h2>
-						<div class="flex items-center gap-2">
+					<div class="border-t border-gray-800 pt-2 flex flex-col min-h-0 flex-1 gap-1.5">
+						<h2 class="text-xs font-mono text-gray-400 shrink-0">test current model / inference</h2>
+						<div class="flex items-center gap-2 shrink-0">
 							<input
 								type="text"
 								bind:value={prompt}
@@ -610,30 +615,30 @@
 								{sampling ? '...' : 'go'}
 							</button>
 						</div>
-						{#if currentInference}
-							<div class="flex items-center justify-between text-xs font-mono text-gray-500">
-								<span>
-									{#if currentInference.prompt}"{currentInference.prompt}"{:else}(empty prompt){/if}
-									· t={currentInference.temperature}
-								</span>
+						<div class="flex-1 min-h-0 overflow-y-auto">
+							{#if sampling && streamingOutput}
+								<pre class="text-xs text-gray-300 whitespace-pre-wrap break-all font-mono leading-relaxed">{streamingOutput}<span class="animate-pulse">▌</span></pre>
+							{:else if currentInference}
 								{#if inferences.length > 1}
-									<div class="flex items-center gap-1">
-										<button
-											onclick={() => { inferenceIdx = Math.min(inferenceIdx + 1, inferences.length - 1); }}
-											disabled={inferenceIdx >= inferences.length - 1}
-											class="px-1 hover:text-gray-300 disabled:opacity-30"
-										>←</button>
-										<span>{inferences.length - inferenceIdx}/{inferences.length}</span>
-										<button
-											onclick={() => { inferenceIdx = Math.max(inferenceIdx - 1, 0); }}
-											disabled={inferenceIdx <= 0}
-											class="px-1 hover:text-gray-300 disabled:opacity-30"
-										>→</button>
+									<div class="flex items-center justify-end text-xs font-mono text-gray-500 mb-1">
+										<div class="flex items-center gap-1">
+											<button
+												onclick={() => { inferenceIdx = Math.min(inferenceIdx + 1, inferences.length - 1); }}
+												disabled={inferenceIdx >= inferences.length - 1}
+												class="px-1 hover:text-gray-300 disabled:opacity-30"
+											>←</button>
+											<span>{inferences.length - inferenceIdx}/{inferences.length}</span>
+											<button
+												onclick={() => { inferenceIdx = Math.max(inferenceIdx - 1, 0); }}
+												disabled={inferenceIdx <= 0}
+												class="px-1 hover:text-gray-300 disabled:opacity-30"
+											>→</button>
+										</div>
 									</div>
 								{/if}
-							</div>
-							<pre class="text-xs text-gray-300 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-48 overflow-y-auto">{currentInference.output}</pre>
-						{/if}
+								<pre class="text-xs text-gray-300 whitespace-pre-wrap break-all font-mono leading-relaxed">{currentInference.output}</pre>
+							{/if}
+						</div>
 					</div>
 				</div>
 

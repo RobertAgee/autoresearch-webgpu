@@ -8,7 +8,8 @@ export async function sampleText(
 	config: ExperimentConfig,
 	prompt: string = '',
 	maxTokens: number = 200,
-	temperature: number = 0.8
+	temperature: number = 0.8,
+	onToken?: (textSoFar: string) => void
 ): Promise<string> {
 	const encoder = new TextEncoder();
 	const promptBytes = prompt ? Array.from(encoder.encode(prompt)) : [0];
@@ -34,6 +35,10 @@ export async function sampleText(
 		const probsArr = (await probs.jsAsync()) as number[];
 		const nextToken = sampleFromProbs(probsArr);
 		tokens.push(nextToken);
+
+		if (onToken) {
+			onToken(decode(new Uint8Array(tokens)));
+		}
 	}
 
 	return decode(new Uint8Array(tokens));
