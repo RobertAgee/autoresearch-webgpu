@@ -1,2 +1,1 @@
-*.ts linguist-language=TypeScript
-*.svelte linguist-language=Svelte
+src/lib/research/baseline.ts linguist-generated
