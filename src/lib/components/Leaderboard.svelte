@@ -30,15 +30,19 @@
 		<button
 			onclick={() => onSelect?.(exp)}
 			class="w-full flex items-center gap-1.5 font-mono text-[11px] px-1.5 py-1 rounded transition-colors
-				{selected?.id === exp.id ? 'bg-blue-950/50 text-blue-300' : exp.id === bestId ? 'bg-green-950/50 text-green-300' : 'text-gray-400 hover:bg-gray-800'}"
+				{exp.id === -1 ? 'bg-red-950/50 text-red-300' : selected?.id === exp.id ? 'bg-blue-950/50 text-blue-300' : exp.id === bestId ? 'bg-green-950/50 text-green-300' : 'text-gray-400 hover:bg-gray-800'}"
 		>
-			<span class="shrink-0 w-3 text-center {exp.source === 'auto' ? 'text-blue-400' : 'text-gray-500'}" title={exp.source === 'auto' ? 'auto (Claude)' : 'manual'}>
-				{exp.source === 'auto' ? 'A' : 'M'}
-			</span>
+			{#if exp.id === -1}
+				<span class="shrink-0 w-3 text-center text-red-400 animate-pulse" title="in progress">*</span>
+			{:else}
+				<span class="shrink-0 w-3 text-center {exp.source === 'auto' ? 'text-blue-400' : 'text-gray-500'}" title={exp.source === 'auto' ? 'auto (Claude)' : 'manual'}>
+					{exp.source === 'auto' ? 'A' : 'M'}
+				</span>
+			{/if}
 			<span class="truncate text-left flex-1" title={exp.reasoning}>
 				{exp.name || `#${exp.id}`}
 			</span>
-			<span class="tabular-nums shrink-0">{exp.valBpb.toFixed(3)}</span>
+			<span class="tabular-nums shrink-0">{exp.id === -1 && exp.valBpb === Infinity ? '...' : exp.valBpb.toFixed(3)}</span>
 		</button>
 	{/each}
 

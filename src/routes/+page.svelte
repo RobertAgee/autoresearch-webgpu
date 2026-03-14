@@ -217,6 +217,11 @@
 		if (!trainLoader || !valLoader || running) return;
 
 		running = true;
+		waitingForRecommendation = true;
+		lossData = [];
+		status = 'starting...';
+		currentRunName = '';
+		currentReasoning = '';
 		controller = new ResearchController();
 		controller.constraints = constraints;
 		setListMode('current');
@@ -230,19 +235,36 @@
 
 		await controller.run(trainLoader, valLoader, {
 			onExperimentStart(cfg, reasoning) {
+				waitingForRecommendation = false;
 				lossData = [];
 				currentReasoning = reasoning;
 				currentRunName = `Research #${(controller?.history.length ?? 0) + 1}`;
 				status = `experiment: ${reasoning}`;
-				// If viewing current run, clear selection so live data shows
 				if (listMode === 'current') setSelectedExp(null);
+				// Create in-progress experiment
+				inProgressExp = {
+					id: -1,
+					name: currentRunName,
+					source: 'auto',
+					config: cfg,
+					valBpb: Infinity,
+					elapsed: 0,
+					totalSteps: 0,
+					reasoning,
+					kept: false,
+				};
 			},
 			onStep(m: StepMetrics) {
 				lossData = [...lossData, { step: m.step, loss: m.loss }];
+				if (inProgressExp) {
+					inProgressExp = { ...inProgressExp, valBpb: m.loss, totalSteps: m.step, elapsed: m.elapsed };
+				}
 			},
 			async onExperimentDone(record: ExperimentRecord) {
+				inProgressExp = null;
+				waitingForRecommendation = true;
 				await loadFromDb();
-				await selectExperimentById(record.id);
+				if (listMode === 'current') setSelectedExp(null);
 				if (record.kept && controller) {
 					config = { ...controller.bestConfig };
 				}
@@ -253,6 +275,8 @@
 			}
 		});
 
+		inProgressExp = null;
+		waitingForRecommendation = false;
 		running = false;
 	}
 
@@ -484,7 +508,7 @@
 						<button
 							onclick={startResearch}
 							disabled={status === 'loading data...'}
-							class="w-full rounded bg-green-600 hover:bg-green-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors"
+							class="w-full rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors"
 						>
 							start research
 						</button>
@@ -526,10 +550,14 @@
 						{/if}
 					{:else if running}
 						<div class="flex items-center gap-2 font-mono text-xs">
-							<span class="px-1 py-0.5 rounded text-[10px] bg-yellow-900/50 text-yellow-300 animate-pulse">running</span>
-							<span class="text-gray-200">{currentRunName || 'training...'}</span>
+							<span class="px-1 py-0.5 rounded text-[10px] bg-blue-900/50 text-blue-300 animate-pulse">
+								{waitingForRecommendation ? 'thinking' : 'running'}
+							</span>
+							<span class="text-gray-200">
+								{waitingForRecommendation ? 'Claude generating experiment ideas...' : currentRunName || 'training...'}
+							</span>
 						</div>
-						{#if currentReasoning}
+						{#if currentReasoning && !waitingForRecommendation}
 							<p class="text-[11px] text-gray-400 font-mono line-clamp-2" title={currentReasoning}>{currentReasoning}</p>
 						{/if}
 						<p class="text-[11px] text-gray-500 font-mono">{status}</p>
@@ -619,7 +647,7 @@
 						<span class="text-gray-500 text-[10px] font-mono">{experiments.length}</span>
 					</div>
 					<div class="flex-1 min-h-0 overflow-y-auto">
-						<Leaderboard {experiments} onSelect={selectExperiment} selected={selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null} sortByLoss={listMode === 'leaderboard'} />
+						<Leaderboard experiments={allExperiments} onSelect={selectExperiment} selected={selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null} sortByLoss={listMode === 'leaderboard'} />
 					</div>
 					{#if experiments.length > 0}
 						<div class="flex gap-3 mt-2 pt-2 border-t border-gray-800 shrink-0">
