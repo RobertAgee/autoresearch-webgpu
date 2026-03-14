@@ -25,24 +25,24 @@ export type ExperimentConfig = {
 	vocabSize: number;
 };
 
-/** Sensible defaults for M4 WebGPU (~1.5M params). */
+/** Sensible defaults for M4 WebGPU — small enough for fast training loops. */
 export const DEFAULT_CONFIG: ExperimentConfig = {
-	nLayer: 4,
-	nEmbd: 128,
+	nLayer: 3,
+	nEmbd: 96,
 	nHead: 4,
 	mlpRatio: 4,
 	activation: 'relu_sq',
 	useRoPE: true,
 	softcapValue: 15,
 
-	lr: 3e-4,
+	lr: 1e-3,
 	weightDecay: 0.1,
 	warmupRatio: 0.1,
 	cooldownRatio: 0.3,
-	batchSize: 16,
-	seqLen: 256,
+	batchSize: 8,
+	seqLen: 128,
 
-	trainSeconds: 60,
+	trainSeconds: 15,
 
 	vocabSize: 256
 };

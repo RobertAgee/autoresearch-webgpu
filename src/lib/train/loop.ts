@@ -42,7 +42,7 @@ export async function trainRun(
 	const baseLr = config.lr;
 	const optimizer = adamw((step: number) => {
 		const progress = Math.min(elapsed / (config.trainSeconds * 1000), 1);
-		return -baseLr * lrMultiplier(progress, config.warmupRatio, config.cooldownRatio);
+		return baseLr * lrMultiplier(progress, config.warmupRatio, config.cooldownRatio);
 	}, { weightDecay: config.weightDecay, b1: 0.9, b2: 0.95 });
 
 	let optState = optimizer.init(tree.ref(params));

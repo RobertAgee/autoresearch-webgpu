@@ -12,56 +12,48 @@ export function initParams(config: ExperimentConfig, key: np.Array): Params {
 	const numKeys = 3 + nLayer * 8;
 	const keys = random.split(key, numKeys);
 	let ki = 0;
-	let k: np.Array;
 
-	k = keys.slice(ki++);
-	params['embed'] = random.normal(k, [vocabSize, nEmbd]).mul(1.0);
+	// Helper: grab a key from `keys`, using .ref to keep it alive for future slices.
+	// The last call should use `keys` directly (no .ref) to consume it.
+	const grabKey = () => {
+		ki++;
+		if (ki < numKeys) return keys.ref.slice(ki - 1);
+		return keys.slice(ki - 1); // last use, consume keys
+	};
+
+	params['embed'] = random.normal(grabKey(), [vocabSize, nEmbd]).mul(1.0);
 
 	for (let i = 0; i < nLayer; i++) {
 		const s = Math.sqrt(3) * Math.pow(nEmbd, -0.5);
 		const prefix = `layer${i}`;
 
-		k = keys.slice(ki++);
-		params[`${prefix}.attn.wq`] = random.uniform(k, [nEmbd, nHead * headDim], {
-			minval: -s,
-			maxval: s
+		params[`${prefix}.attn.wq`] = random.uniform(grabKey(), [nEmbd, nHead * headDim], {
+			minval: -s, maxval: s
 		});
-
-		k = keys.slice(ki++);
-		params[`${prefix}.attn.wk`] = random.uniform(k, [nEmbd, nHead * headDim], {
-			minval: -s,
-			maxval: s
+		params[`${prefix}.attn.wk`] = random.uniform(grabKey(), [nEmbd, nHead * headDim], {
+			minval: -s, maxval: s
 		});
-
-		k = keys.slice(ki++);
-		params[`${prefix}.attn.wv`] = random.uniform(k, [nEmbd, nHead * headDim], {
-			minval: -s,
-			maxval: s
+		params[`${prefix}.attn.wv`] = random.uniform(grabKey(), [nEmbd, nHead * headDim], {
+			minval: -s, maxval: s
 		});
-
-		k = keys.slice(ki++);
 		params[`${prefix}.attn.wout`] = np.zeros([nEmbd, nEmbd]);
+		grabKey(); // consume the key even though we don't use it
 
-		k = keys.slice(ki++);
 		params[`${prefix}.norm1`] = np.ones([nEmbd]);
+		grabKey();
 
-		k = keys.slice(ki++);
 		params[`${prefix}.norm2`] = np.ones([nEmbd]);
+		grabKey();
 
-		k = keys.slice(ki++);
-		params[`${prefix}.mlp.up`] = random.uniform(k, [nEmbd, mlpHidden], {
-			minval: -s,
-			maxval: s
+		params[`${prefix}.mlp.up`] = random.uniform(grabKey(), [nEmbd, mlpHidden], {
+			minval: -s, maxval: s
 		});
-
-		k = keys.slice(ki++);
 		params[`${prefix}.mlp.down`] = np.zeros([mlpHidden, nEmbd]);
+		grabKey();
 	}
 
 	params['final_norm'] = np.ones([nEmbd]);
-
-	k = keys.slice(ki++);
-	params['unembed'] = random.normal(k, [nEmbd, vocabSize]).mul(0.001);
+	params['unembed'] = random.normal(grabKey(), [nEmbd, vocabSize]).mul(0.001);
 
 	return params;
 }
@@ -72,20 +64,23 @@ function rmsNorm(x: np.Array, weight: np.Array): np.Array {
 
 function ropeFreqs(seqLen: number, headDim: number): [np.Array, np.Array] {
 	const halfDim = headDim / 2;
-	const freqExponents = np.arange(0, halfDim).mul(2 / headDim);
+	const freqExponents = np.arange(0, halfDim, 1, { dtype: np.float32 }).mul(2 / headDim);
 	const invFreq = np.power(10000, np.negative(freqExponents));
-	const positions = np.arange(seqLen).astype(np.float32);
+	const positions = np.arange(0, seqLen, 1, { dtype: np.float32 });
 	const angles = np.outer(positions, invFreq);
-	return [np.cos(angles), np.sin(angles)];
+	return [np.cos(angles.ref), np.sin(angles)];
 }
 
 function applyRoPE(x: np.Array, cos: np.Array, sin: np.Array): np.Array {
 	const half = x.shape[3] / 2;
-	const x1 = x.slice([], [], [], [0, half]);
+	const x1 = x.ref.slice([], [], [], [0, half]);
 	const x2 = x.slice([], [], [], [half]);
 	const c = cos.reshape([1, -1, 1, half]);
 	const s = sin.reshape([1, -1, 1, half]);
-	return np.concatenate([x1.mul(c).sub(x2.mul(s)), x1.mul(s).add(x2.mul(c))], -1);
+	return np.concatenate([
+		x1.ref.mul(c.ref).sub(x2.ref.mul(s.ref)),
+		x1.mul(c).add(x2.mul(s))
+	], -1);
 }
 
 function activate(x: np.Array, activation: Activation): np.Array {
@@ -108,7 +103,9 @@ export function forward(
 	const headDim = nEmbd / nHead;
 	const [_batch, seqLen] = inputIds.shape;
 
-	let x = params['embed'].slice(inputIds);
+	// oneHot + matmul instead of gather (gather transpose not implemented in jax-js)
+	const oneHotIds = nn.oneHot(inputIds.reshape([-1]), config.vocabSize);
+	let x = np.dot(oneHotIds, params['embed'].ref).reshape([-1, seqLen, nEmbd]);
 
 	let ropeCos: np.Array | null = null;
 	let ropeSin: np.Array | null = null;
@@ -118,31 +115,37 @@ export function forward(
 
 	for (let i = 0; i < nLayer; i++) {
 		const prefix = `layer${i}`;
+		const isLastLayer = i === nLayer - 1;
 
-		const normed = rmsNorm(x, params[`${prefix}.norm1`]);
+		// x is reused for residual connection: .ref for rmsNorm, consume in .add
+		const normed = rmsNorm(x.ref, params[`${prefix}.norm1`].ref);
 
-		let q = np.dot(normed, params[`${prefix}.attn.wq`]).reshape([-1, seqLen, nHead, headDim]);
-		let k = np.dot(normed, params[`${prefix}.attn.wk`]).reshape([-1, seqLen, nHead, headDim]);
-		const v = np.dot(normed, params[`${prefix}.attn.wv`]).reshape([-1, seqLen, nHead, headDim]);
+		// normed is used 3 times (q, k, v projections)
+		let q = np.dot(normed.ref, params[`${prefix}.attn.wq`].ref).reshape([-1, seqLen, nHead, headDim]);
+		let k = np.dot(normed.ref, params[`${prefix}.attn.wk`].ref).reshape([-1, seqLen, nHead, headDim]);
+		const v = np.dot(normed, params[`${prefix}.attn.wv`].ref).reshape([-1, seqLen, nHead, headDim]);
 
 		if (useRoPE && ropeCos && ropeSin) {
-			q = applyRoPE(q, ropeCos, ropeSin);
-			k = applyRoPE(k, ropeCos, ropeSin);
+			// .ref on rope arrays if not last layer (they're reused across layers)
+			const cosArg = isLastLayer ? ropeCos : ropeCos.ref;
+			const sinArg = isLastLayer ? ropeSin : ropeSin.ref;
+			q = applyRoPE(q, cosArg.ref, sinArg.ref);
+			k = applyRoPE(k, cosArg, sinArg);
 		}
 
 		const attnOut = nn.dotProductAttention(q, k, v, { isCausal: true });
-		const projected = np.dot(attnOut.reshape([-1, seqLen, nEmbd]), params[`${prefix}.attn.wout`]);
+		const projected = np.dot(attnOut.reshape([-1, seqLen, nEmbd]), params[`${prefix}.attn.wout`].ref);
 		x = x.add(projected);
 
-		const normed2 = rmsNorm(x, params[`${prefix}.norm2`]);
-		let h = np.dot(normed2, params[`${prefix}.mlp.up`]);
+		const normed2 = rmsNorm(x.ref, params[`${prefix}.norm2`].ref);
+		let h = np.dot(normed2, params[`${prefix}.mlp.up`].ref);
 		h = activate(h, activation);
-		h = np.dot(h, params[`${prefix}.mlp.down`]);
+		h = np.dot(h, params[`${prefix}.mlp.down`].ref);
 		x = x.add(h);
 	}
 
-	x = rmsNorm(x, params['final_norm']);
-	let logits = np.dot(x, params['unembed']);
+	x = rmsNorm(x, params['final_norm'].ref);
+	let logits = np.dot(x, params['unembed'].ref);
 
 	if (softcapValue > 0) {
 		logits = np.tanh(logits.mul(1 / softcapValue)).mul(softcapValue);
