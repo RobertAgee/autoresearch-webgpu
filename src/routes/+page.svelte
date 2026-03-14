@@ -423,12 +423,12 @@
 	<meta name="description" content="Train small language models in your browser using WebGPU. Tune hyperparameters manually or let Claude do it automatically — a model training another model." />
 	<meta property="og:title" content="autoresearch-webgpu" />
 	<meta property="og:description" content="Train small language models in your browser using WebGPU. Tune hyperparameters manually or let Claude do it automatically — a model training another model." />
-	<meta property="og:image" content="/demo.gif" />
+	<meta property="og:image" content="https://autoresearch.lucasgelfond.online/demo.gif" />
 	<meta property="og:type" content="website" />
 	<meta name="twitter:card" content="summary_large_image" />
 	<meta name="twitter:title" content="autoresearch-webgpu" />
 	<meta name="twitter:description" content="Train small language models in your browser using WebGPU. Tune hyperparameters manually or let Claude do it automatically." />
-	<meta name="twitter:image" content="/demo.gif" />
+	<meta name="twitter:image" content="https://autoresearch.lucasgelfond.online/demo.gif" />
 </svelte:head>
 
 <main class="px-6 py-12 max-w-6xl mx-auto space-y-5">
