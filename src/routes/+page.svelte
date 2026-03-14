@@ -401,14 +401,14 @@
 </script>
 
 <svelte:head>
-	<title>autoresearch-webgpu</title>
+	<title>autoresearch, in the browser!</title>
 	<meta name="description" content="Train small language models in your browser using WebGPU. Claude writes the training code, runs experiments, and iterates — a model training another model!" />
-	<meta property="og:title" content="autoresearch-webgpu" />
+	<meta property="og:title" content="autoresearch, in the browser!" />
 	<meta property="og:description" content="Train small language models in your browser using WebGPU. Claude writes the training code, runs experiments, and iterates." />
 	<meta property="og:image" content="https://autoresearch.lucasgelfond.online/demo.gif" />
 	<meta property="og:type" content="website" />
 	<meta name="twitter:card" content="summary_large_image" />
-	<meta name="twitter:title" content="autoresearch-webgpu" />
+	<meta name="twitter:title" content="autoresearch, in the browser!" />
 	<meta name="twitter:description" content="Train small language models in your browser using WebGPU. Claude writes the training code and iterates." />
 	<meta name="twitter:image" content="https://autoresearch.lucasgelfond.online/demo.gif" />
 </svelte:head>
