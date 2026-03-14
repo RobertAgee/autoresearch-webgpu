@@ -397,6 +397,8 @@
 
 	let currentInference = $derived(inferences.length > 0 ? inferences[inferenceIdx] : null);
 	let selectedExp = $derived(selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null);
+	let hasAnyModel = $derived(experiments.length > 0 || running);
+	let isFirstLoad = $derived(experiments.length === 0 && !running && status === 'ready');
 
 	/** Previous experiment's config, for showing diff. */
 	let prevExpConfig = $derived.by(() => {
@@ -430,16 +432,28 @@
 			{gpuStatus.reason}
 		</div>
 	{:else}
-		<div class="max-w-xl">
+		<div class="max-w-xl space-y-3">
 			<h1 class="text-lg font-mono text-gray-200">autoresearch-webgpu</h1>
-			<p class="text-xs font-mono text-gray-500">
+			<p class="text-[11px] font-mono text-gray-500 leading-relaxed">
 				Based on Andrej Karpathy's <a href="https://github.com/karpathy/autoresearch" class="underline hover:text-gray-300">autoresearch</a> and built on Eric Zhang's <a href="https://github.com/ekzhang/jax-js" class="underline hover:text-gray-300">jax-js</a>. Built by <a href="https://lucasgelfond.online" class="underline hover:text-gray-300">Lucas Gelfond</a>. Source <a href="https://github.com/lucasgelfond/autoresearch-webgpu" class="underline hover:text-gray-300">here</a>.
 			</p>
-			<p class="text-xs font-mono text-gray-600 mt-2">
-				This playground trains small models on your laptop's GPU, and uses the results + Claude to build better models. Lower loss means a better model. 
-				
+			<p class="text-[11px] font-mono text-gray-600 leading-relaxed">
+				This playground trains small language models inside of your browser. Part of this process involves tuning <a href="https://en.wikipedia.org/wiki/Hyperparameter_(machine_learning)" target="_blank" rel="noopener noreferrer" class="decoration-dotted underline underline-offset-2 decoration-gray-500 hover:text-gray-400 hover:decoration-gray-400">"hyperparameters,"</a> model training settings. You can set these manually, or use Claude to set them — a model training another model! Lower loss = better.
 			</p>
 		</div>
+		{#if isFirstLoad}
+		<div class="flex flex-col items-center justify-center space-y-6 mx-auto" style="min-height: calc(100vh - 14rem);">
+			<button
+				onclick={() => { mode = 'manual'; startManualTraining(); }}
+				class="rounded-lg bg-blue-600 hover:bg-blue-500 px-8 py-4 font-mono text-sm text-white transition-colors"
+			>
+				start research
+			</button>
+			<p class="text-xs font-mono text-gray-500 max-w-sm text-center">
+				begin by training a base model in your browser. you can then iterate manually, or let Claude suggest experiments automatically.
+			</p>
+		</div>
+		{:else}
 		<div class="flex items-center gap-3">
 			<div class="flex rounded border border-gray-700 text-xs font-mono overflow-hidden">
 				<button
@@ -472,7 +486,7 @@
 			<!-- Left: config + controls -->
 			<div class="flex flex-col md:h-full">
 				<div class="rounded border border-gray-800 p-3 flex-1">
-					<div class="flex items-center justify-between mb-2">
+					<div class="flex items-center justify-between mb-1">
 						<h2 class="text-xs font-mono text-gray-400">config</h2>
 						<button
 							onclick={() => (config = { ...DEFAULT_CONFIG })}
@@ -585,8 +599,9 @@
 					</div>
 
 					<!-- Inference -->
+					{#if hasAnyModel}
 					<div class="border-t border-gray-800 pt-2 flex flex-col min-h-0 flex-1 gap-1.5">
-						<h2 class="text-xs font-mono text-gray-400 shrink-0">test current model / inference</h2>
+						<h2 class="text-xs font-mono text-gray-400 shrink-0">inference</h2>
 						<div class="flex items-center gap-2 shrink-0">
 							<input
 								type="text"
@@ -640,6 +655,7 @@
 							{/if}
 						</div>
 					</div>
+					{/if}
 				</div>
 
 				</div>
@@ -677,6 +693,7 @@
 				</div>
 			</div>
 		</div>
+		{/if}
 	{/if}
 
 	{#if showConstraints}

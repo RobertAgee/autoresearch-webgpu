@@ -1,7 +1,14 @@
 name = "autoresearch-webgpu"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
-pages_build_output_dir = ".svelte-kit/cloudflare"
+main = ".svelte-kit/cloudflare/_worker.js"
+routes = [
+  { pattern = "autoresearch.lucasgelfond.online", custom_domain = true }
+]
+
+[assets]
+directory = ".svelte-kit/cloudflare"
+binding = "ASSETS"
 
 [[unsafe.bindings]]
 name = "RATE_LIMITER"
