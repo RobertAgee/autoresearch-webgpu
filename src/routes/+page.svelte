@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { initWebGPU, type WebGPUStatus } from '$lib/webgpu';
-	import { DEFAULT_CONFIG, DEFAULT_CONSTRAINTS, type ExperimentConfig, type ParamConstraints } from '$lib/model/config';
+	import { DEFAULT_CONFIG, DEFAULT_CONSTRAINTS, estimateParams, type ExperimentConfig, type ParamConstraints } from '$lib/model/config';
 	import { DataLoader } from '$lib/data/loader';
 	import { trainRun, type StepMetrics, type RunResult } from '$lib/train/loop';
 	import { sampleText } from '$lib/sample';
@@ -12,7 +12,6 @@
 		getBestExperiment, getInferencesForExperiment, getAllLossCurves, clearAllData,
 		exportCsvZip, updateWeightsPath, rowToConfig, type ExperimentRow, type InferenceRow
 	} from '$lib/db';
-	import { estimateParams } from '$lib/model/config';
 	import { saveWeights, loadWeights } from '$lib/weights';
 	import LossChart from '$lib/components/LossChart.svelte';
 	import ConfigEditor from '$lib/components/ConfigEditor.svelte';
@@ -25,10 +24,10 @@
 	let config = $state<ExperimentConfig>({ ...DEFAULT_CONFIG });
 	let running = $state(false);
 	let lossData = $state<{ step: number; loss: number }[]>([]);
-	let status = $state('idle');
+	let status = $state<string>('initializing');
 	let result = $state<RunResult | null>(null);
 	let sampling = $state(false);
-	let mode = $state<'manual' | 'research'>('manual');
+	let mode = $state<'manual' | 'research'>('research');
 	let experiments = $state<ExperimentRecord[]>([]);
 	let currentReasoning = $state('');
 	let experimentName = $state(petname());
@@ -43,7 +42,6 @@
 	let inferenceIdx = $state(0);
 	let currentExpDbId = $state<number | null>(null);
 	let streamingOutput = $state('');
-	let viewingLiveRun = $state(true);
 	let currentRunName = $state('');
 	let trainAbort: AbortController | null = null;
 	let inProgressExp = $state<ExperimentRecord | null>(null);
@@ -68,9 +66,14 @@
 	let controller: ResearchController | null = null;
 
 	onMount(async () => {
-		await getDb();
-		gpuStatus = await initWebGPU();
-		if (gpuStatus.ok) {
+		try {
+			status = 'initializing';
+			await getDb();
+			gpuStatus = await initWebGPU();
+			if (!gpuStatus.ok) {
+				status = 'error';
+				return;
+			}
 			status = 'loading data...';
 			[trainLoader, valLoader] = await Promise.all([
 				DataLoader.fetch('/data/train.bin'),
@@ -88,14 +91,15 @@
 			const viewParam = params.get('view');
 			if (viewParam === 'current' || viewParam === 'leaderboard') listMode = viewParam;
 			status = 'ready';
+		} catch (e) {
+			console.error('Init failed:', e);
+			status = 'error';
 		}
 	});
 
-	let lossCurvesMap = $state(new Map<number, { step: number; loss: number }[]>());
-
 	async function loadFromDb() {
 		const rows = await getAllExperiments();
-		lossCurvesMap = await getAllLossCurves();
+		const lossCurvesMap = await getAllLossCurves();
 		experiments = rows.map(row => ({
 			...rowToRecord(row),
 			lossCurve: lossCurvesMap.get(row.id) ?? row.loss_curve ?? undefined
@@ -315,7 +319,11 @@
 
 	function selectExperimentById(id: number) {
 		setSelectedExp(id);
+		// Clear previous experiment's inference state
+		inferences = [];
 		inferenceIdx = 0;
+		streamingOutput = '';
+		sampling = false;
 		// Load inferences in background — don't block the UI
 		getInferencesForExperiment(id).then(rows => {
 			if (selectedExpId === id) {
@@ -366,9 +374,9 @@
 	let showClearModal = $state(false);
 	let showConstraints = $state(false);
 	let constraints = $state<ParamConstraints>({ ...DEFAULT_CONSTRAINTS });
-	let maxParams = $state(400_000_000);
+	const maxParams = 400_000_000;
 
-	async function handleClear() {
+	function handleClear() {
 		showClearModal = true;
 	}
 
@@ -398,7 +406,8 @@
 	let currentInference = $derived(inferences.length > 0 ? inferences[inferenceIdx] : null);
 	let selectedExp = $derived(selectedExpId ? experiments.find(e => e.id === selectedExpId) ?? null : null);
 	let hasAnyModel = $derived(experiments.length > 0 || running);
-	let isFirstLoad = $derived(experiments.length === 0 && !running && status === 'ready');
+	let loaded = $derived(status === 'ready' || status === 'error' || running || experiments.length > 0);
+	let isFirstLoad = $derived(experiments.length === 0 && !running && status !== 'error');
 
 	/** Previous experiment's config, for showing diff. */
 	let prevExpConfig = $derived.by(() => {
@@ -407,27 +416,23 @@
 		if (idx <= 0) return null;
 		return experiments[idx - 1].config;
 	});
-	/** True when viewing an old experiment's config (inputs should be locked). */
-	let viewingExisting = $derived(!!selectedExpId && !running);
-
-	function forkFromSelected() {
-		if (!selectedExp) return;
-		const baseName = selectedExp.name;
-		experimentName = `${baseName} (fork)`;
-		experimentDesc = '';
-		// config is already set from selectExperiment — just unlock
-		setSelectedExp(null);
-	}
 </script>
 
 <svelte:head>
 	<title>autoresearch-webgpu</title>
+	<meta name="description" content="Train small language models in your browser using WebGPU. Tune hyperparameters manually or let Claude do it automatically — a model training another model." />
+	<meta property="og:title" content="autoresearch-webgpu" />
+	<meta property="og:description" content="Train small language models in your browser using WebGPU. Tune hyperparameters manually or let Claude do it automatically — a model training another model." />
+	<meta property="og:image" content="/demo.gif" />
+	<meta property="og:type" content="website" />
+	<meta name="twitter:card" content="summary_large_image" />
+	<meta name="twitter:title" content="autoresearch-webgpu" />
+	<meta name="twitter:description" content="Train small language models in your browser using WebGPU. Tune hyperparameters manually or let Claude do it automatically." />
+	<meta name="twitter:image" content="/demo.gif" />
 </svelte:head>
 
 <main class="px-6 py-12 max-w-6xl mx-auto space-y-5">
-	{#if gpuStatus === null}
-		<p class="text-gray-400 font-mono text-sm">initializing webgpu...</p>
-	{:else if !gpuStatus.ok}
+	{#if gpuStatus && !gpuStatus.ok}
 		<div class="rounded border border-red-800 bg-red-950 p-4 font-mono text-sm text-red-400">
 			{gpuStatus.reason}
 		</div>
@@ -441,17 +446,25 @@
 				This playground trains small language models inside of your browser. Part of this process involves tuning <a href="https://en.wikipedia.org/wiki/Hyperparameter_(machine_learning)" target="_blank" rel="noopener noreferrer" class="decoration-dotted underline underline-offset-2 decoration-gray-500 hover:text-gray-400 hover:decoration-gray-400">"hyperparameters,"</a> model training settings. You can set these manually, or use Claude to set them — a model training another model! Lower loss = better.
 			</p>
 		</div>
-		{#if isFirstLoad}
+		{#if status === 'error'}
+			<div class="rounded border border-red-800 bg-red-950 p-4 font-mono text-sm text-red-400 mt-4">
+				something went wrong during initialization. check the console for details.
+			</div>
+		{:else if isFirstLoad}
 		<div class="flex flex-col items-center justify-center space-y-6 mx-auto" style="min-height: calc(100vh - 14rem);">
-			<button
-				onclick={() => { mode = 'manual'; startManualTraining(); }}
-				class="rounded-lg bg-blue-600 hover:bg-blue-500 px-8 py-4 font-mono text-sm text-white transition-colors"
-			>
-				start research
-			</button>
-			<p class="text-xs font-mono text-gray-500 max-w-sm text-center">
-				begin by training a base model in your browser. you can then iterate manually, or let Claude suggest experiments automatically.
-			</p>
+			{#if status === 'ready'}
+				<button
+					onclick={() => { mode = 'research'; startResearch(); }}
+					class="rounded-lg bg-blue-600 hover:bg-blue-500 px-8 py-4 font-mono text-sm text-white transition-colors"
+				>
+					start research
+				</button>
+				<p class="text-xs font-mono text-gray-500 max-w-sm text-center">
+					begin by training a base model in your browser. you can then iterate manually, or let Claude suggest experiments automatically.
+				</p>
+			{:else}
+				<p class="text-sm font-mono text-gray-500">{status === 'initializing' ? 'initializing...' : status}</p>
+			{/if}
 		</div>
 		{:else}
 		<div class="flex items-center gap-3">
