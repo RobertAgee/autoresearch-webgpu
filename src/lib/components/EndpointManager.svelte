@@ -11,10 +11,12 @@
 		profiles = $bindable(),
 		selectedId = $bindable(),
 		disabled = false,
+		showHeader = true,
 	}: {
 		profiles: ResearchEndpointProfile[];
 		selectedId: string | null;
 		disabled?: boolean;
+		showHeader?: boolean;
 	} = $props();
 
 	let selectedProfile = $derived(
@@ -69,13 +71,15 @@
 
 <div class="rounded border border-gray-800 bg-gray-950/60 p-3 space-y-3">
 	<div class="flex items-start justify-between gap-3">
-		<div>
-			<h2 class="text-xs font-mono text-gray-300">research backends</h2>
-			<p class="text-[10px] font-mono text-gray-500 mt-1">
-				keys are stored locally in this browser only.
-			</p>
-		</div>
-		<div class="flex gap-1 shrink-0">
+		{#if showHeader}
+			<div>
+				<h2 class="text-xs font-mono text-gray-300">research backends</h2>
+				<p class="text-[10px] font-mono text-gray-500 mt-1">
+					keys are stored locally in this browser only.
+				</p>
+			</div>
+		{/if}
+		<div class="flex gap-1 shrink-0 {showHeader ? '' : 'ml-auto'}">
 			<button
 				type="button"
 				class="rounded border border-gray-700 px-2 py-1 text-[10px] font-mono text-gray-300 hover:border-blue-500 hover:text-white disabled:opacity-40"

@@ -5,7 +5,7 @@
 		experiments,
 		onSelect,
 		selected,
-		sortByLoss = true,
+		sortMode = 'bpb',
 		selectionEnabled = false,
 		selectedIds = [],
 		onToggleBatchSelect
@@ -13,17 +13,34 @@
 		experiments: ExperimentRecord[];
 		onSelect?: (exp: ExperimentRecord) => void;
 		selected?: ExperimentRecord | null;
-		sortByLoss?: boolean;
+		sortMode?: 'bpb' | 'newest' | 'oldest' | 'steps' | 'name';
 		selectionEnabled?: boolean;
 		selectedIds?: number[];
 		onToggleBatchSelect?: (expId: number) => void;
 	} = $props();
 
-	let sorted = $derived(
-		sortByLoss
-			? [...experiments].sort((a, b) => a.valBpb - b.valBpb)
-			: [...experiments].reverse()
-	);
+	let dataGridTemplate = '14px 44px minmax(0,1fr) 12px 28px 44px';
+
+	let sorted = $derived.by(() => {
+		const items = [...experiments];
+		switch (sortMode) {
+			case 'name':
+				return items.sort(
+					(a, b) =>
+						(a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' }) ||
+						b.id - a.id
+				);
+			case 'newest':
+				return items.sort((a, b) => b.id - a.id);
+			case 'oldest':
+				return items.sort((a, b) => a.id - b.id);
+			case 'steps':
+				return items.sort((a, b) => b.totalSteps - a.totalSteps || a.valBpb - b.valBpb);
+			case 'bpb':
+			default:
+				return items.sort((a, b) => a.valBpb - b.valBpb || b.id - a.id);
+		}
+	});
 	let bestId = $derived(
 		experiments.length > 0
 			? [...experiments].sort((a, b) => a.valBpb - b.valBpb)[0].id
@@ -32,6 +49,19 @@
 </script>
 
 <div class="space-y-0.5 overflow-y-auto">
+	<div class="sticky top-0 z-10 flex items-center gap-1.5 border-b border-gray-800 bg-gray-950/95 px-1.5 py-1 font-mono text-[9px] uppercase tracking-[0.14em] text-gray-500 backdrop-blur">
+		{#if selectionEnabled}
+			<span class="ml-1 shrink-0 w-3" aria-hidden="true"></span>
+		{/if}
+		<div class="min-w-0 flex-1 grid items-center gap-1.5" style={`grid-template-columns: ${dataGridTemplate};`}>
+			<span class="text-center" title="run source">src</span>
+			<span class="tabular-nums text-right" title="experiment id">run</span>
+			<span class="min-w-0" title="experiment name">experiment</span>
+			<span class="text-center" title="rerun marker">r</span>
+			<span class="tabular-nums text-right" title="training steps">steps</span>
+			<span class="tabular-nums text-right" title="validation bits per byte">bpb</span>
+		</div>
+	</div>
 	{#each sorted as exp, i}
 		<div
 			class="w-full flex items-center gap-1.5 font-mono text-[11px] rounded transition-colors
@@ -51,22 +81,33 @@
 			{/if}
 			<button
 				onclick={() => onSelect?.(exp)}
-				class="min-w-0 flex-1 flex items-center gap-1.5 px-1.5 py-1 text-left"
+				class="min-w-0 flex-1 grid items-center gap-1.5 px-1.5 py-1 text-left"
+				style={`grid-template-columns: ${dataGridTemplate};`}
 			>
 			{#if exp.id === -1}
-				<span class="shrink-0 w-3 text-center text-red-400 animate-pulse" title="in progress">*</span>
+				<span class="text-center text-red-400 animate-pulse" title="in progress">*</span>
 			{:else}
-				<span class="shrink-0 w-3 text-center {exp.source === 'auto' ? 'text-blue-400' : 'text-gray-500'}" title={exp.source === 'auto' ? 'auto (Claude)' : 'manual'}>
+				<span class="text-center {exp.source === 'auto' ? 'text-blue-400' : 'text-gray-500'}" title={exp.source === 'auto' ? 'auto (Claude)' : 'manual'}>
 					{exp.source === 'auto' ? 'A' : 'M'}
 				</span>
+			{/if}
+			{#if exp.id !== -1}
+				<span class="tabular-nums text-[9px] text-right text-gray-500" title={`run #${exp.id}`}>#{exp.id}</span>
+			{:else}
+				<span class="tabular-nums text-[9px] text-right text-gray-500" aria-hidden="true">...</span>
 			{/if}
 			<span class="truncate text-left flex-1" title={exp.reasoning}>
 				{exp.name || `#${exp.id}`}
 			</span>
 			{#if exp.rerunOf}
-				<span class="shrink-0 text-[9px] text-amber-400" title={`rerun of #${exp.rerunOf}`}>R</span>
+				<span class="text-center text-[9px] text-amber-400" title={`rerun of #${exp.rerunOf}`}>R</span>
+			{:else}
+				<span class="text-center" aria-hidden="true"></span>
 			{/if}
-			<span class="tabular-nums shrink-0">{exp.id === -1 && exp.valBpb === Infinity ? '...' : exp.valBpb.toFixed(3)}</span>
+			<span class="tabular-nums text-[9px] text-right text-gray-500" title={`${exp.totalSteps} steps`}>
+				{exp.id === -1 ? '...' : exp.totalSteps}
+			</span>
+			<span class="tabular-nums text-right">{exp.id === -1 && exp.valBpb === Infinity ? '...' : exp.valBpb.toFixed(3)}</span>
 			</button>
 		</div>
 	{/each}

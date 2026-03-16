@@ -56,6 +56,9 @@
 	let importInput = $state<HTMLInputElement | null>(null);
 	let selectionMode = $state(false);
 	let selectedBatchIds = $state<number[]>([]);
+	let workspaceTab = $state<'chart' | 'code' | 'inference'>('chart');
+	let backendCollapsed = $state(false);
+	let leaderboardSort = $state<'bpb' | 'newest' | 'oldest' | 'steps' | 'name'>('bpb');
 
 	// In-memory loaded model state for inference
 	type LoadedModel = { forward: ForwardFn; params: Params; vocabSize: number; seqLen: number; expId: number };
@@ -89,6 +92,18 @@
 	let readyResearchProfile = $derived(
 		isConfiguredProfile(selectedResearchProfile) ? selectedResearchProfile : null
 	);
+	let configuredProfileCount = $derived(
+		researchProfiles.filter((profile) => isConfiguredProfile(profile)).length
+	);
+	let backendSummary = $derived.by(() => {
+		if (readyResearchProfile) {
+			return `${readyResearchProfile.name || readyResearchProfile.model} ready`;
+		}
+		if (configuredProfileCount > 0) {
+			return `${configuredProfileCount} configured profiles`;
+		}
+		return 'no configured backend';
+	});
 
 	onMount(async () => {
 		try {
@@ -96,6 +111,7 @@
 			await getDb();
 			researchProfiles = loadResearchProfiles();
 			selectedResearchProfileId = loadActiveResearchProfileId(researchProfiles);
+			backendCollapsed = researchProfiles.some((profile) => isConfiguredProfile(profile));
 			gpuStatus = await initWebGPU();
 			if (!gpuStatus.ok) { status = 'error'; return; }
 			status = 'loading data...';
@@ -509,6 +525,7 @@
 
 	function setListMode(m: 'leaderboard' | 'current') {
 		listMode = m;
+		leaderboardSort = m === 'leaderboard' ? 'bpb' : 'newest';
 		if (m === 'current') setSelectedExp(null);
 	}
 
@@ -710,212 +727,299 @@
 			</div>
 		</div>
 		{:else}
-		<div class="flex items-center gap-3">
-			<div class="flex rounded border border-gray-700 text-xs font-mono overflow-hidden">
+		<div class="space-y-4">
+			<div class="rounded border border-gray-800 bg-gray-950/60">
 				<button
-					class="px-2.5 py-0.5 {mode === 'manual' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}"
-					onclick={() => (mode = 'manual')}
-					disabled={running}
-				>manual</button>
-				<button
-					class="px-2.5 py-0.5 {mode === 'research' ? 'bg-blue-700 text-white' : 'text-gray-400 hover:text-white'}"
-					onclick={() => (mode = 'research')}
-					disabled={running}
-				>auto</button>
-			</div>
-		</div>
-		<EndpointManager bind:profiles={researchProfiles} bind:selectedId={selectedResearchProfileId} disabled={running} />
-
-		<div class="grid grid-cols-1 md:grid-cols-[1fr_1fr_240px] gap-4 md:h-[calc(100vh-20rem)]">
-			<!-- Left: train.ts code -->
-			<div class="flex flex-col md:h-full md:overflow-hidden">
-				<div class="flex flex-col flex-1 min-h-0">
-					<div class="flex items-center justify-between mb-2 shrink-0">
-						<h2 class="text-xs font-mono text-gray-400">train.ts</h2>
-						<button
-							onclick={() => (code = BASELINE_CODE)}
-							disabled={running}
-							class="text-gray-500 hover:text-gray-300 disabled:opacity-30 text-[10px] font-mono"
-						>reset</button>
+					type="button"
+					class="w-full flex items-center justify-between gap-3 px-3 py-2 text-left"
+					onclick={() => (backendCollapsed = !backendCollapsed)}
+				>
+					<div>
+						<h2 class="text-xs font-mono text-gray-300">research backends</h2>
+						<p class="mt-1 text-[10px] font-mono text-gray-500">{backendSummary}</p>
 					</div>
-					<div class="flex-1 min-h-0">
-						<CodeEditor bind:value={code} disabled={running && mode === 'research'} />
+					<span class="text-xs font-mono text-gray-500">{backendCollapsed ? 'show' : 'hide'}</span>
+				</button>
+				{#if !backendCollapsed}
+					<div class="border-t border-gray-800 p-3">
+						<EndpointManager bind:profiles={researchProfiles} bind:selectedId={selectedResearchProfileId} disabled={running || importing} showHeader={false} />
 					</div>
-				</div>
-				<div class="space-y-2 pt-2 shrink-0">
-					{#if mode === 'manual'}
-						<input
-							type="text"
-							bind:value={experimentName}
-							placeholder="experiment name..."
-							disabled={running}
-							class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40"
-						/>
-						{#if running}
-							<button onclick={stopCurrentRun}
-								class="w-full rounded bg-red-600 hover:bg-red-500 px-3 py-1.5 font-mono text-xs transition-colors">
-								stop training
-							</button>
-						{:else}
-							<button onclick={startManualTraining}
-								disabled={status === 'loading data...'}
-								class="w-full rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors">
-								run train.ts
-							</button>
-						{/if}
-					{:else}
-						{#if !running}
-							<button onclick={startResearch}
-								disabled={status === 'loading data...'}
-								class="w-full rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors">
-								start research
-							</button>
-						{:else}
-							<button onclick={stopCurrentRun}
-								class="w-full rounded bg-red-600 hover:bg-red-500 px-3 py-1.5 font-mono text-xs transition-colors">
-								stop
-							</button>
-						{/if}
-					{/if}
-				</div>
+				{/if}
 			</div>
 
-			<!-- Center: chart + status + inference -->
-			<div class="flex flex-col md:h-full md:overflow-hidden">
-				<div class="rounded border border-gray-800 p-3 space-y-2 flex-1 flex flex-col overflow-hidden">
-					{#if selectedExp}
-						<div class="flex items-center gap-2 font-mono text-xs">
-							<span class="px-1 py-0.5 rounded text-[10px] {selectedExp.source === 'auto' ? 'bg-blue-900/50 text-blue-300' : 'bg-gray-700 text-gray-300'}">
-								{selectedExp.source === 'auto' ? 'auto' : 'manual'}
-							</span>
-							<span class="text-gray-200">{selectedExp.name}</span>
-							<span class="text-gray-500 tabular-nums ml-auto">{selectedExp.valBpb.toFixed(4)} bpb</span>
-						</div>
-						{#if selectedExp.rerunOf || selectedExp.benchmarkGroup}
-							<p class="text-[10px] text-amber-300 font-mono">
-								{#if selectedExp.rerunOf}rerun of #{selectedExp.rerunOf}{/if}
-								{#if selectedExp.rerunOf && selectedExp.benchmarkGroup} · {/if}
-								{#if selectedExp.benchmarkGroup}baseline {selectedExp.benchmarkGroup}{/if}
-							</p>
-						{/if}
-						{#if selectedExp.reasoning}
-							<p class="text-[11px] text-gray-400 font-mono line-clamp-2" title={selectedExp.reasoning}>{selectedExp.reasoning}</p>
-						{/if}
-						{#if selectedExp.error}
-							<p class="text-[11px] text-red-400 font-mono line-clamp-2">error: {selectedExp.error}</p>
-						{/if}
-						<div class="flex items-center gap-2">
-							<button
-								onclick={rerunSelectedExperiment}
-								disabled={running || importing}
-								class="rounded border border-gray-700 px-2 py-1 font-mono text-[10px] text-gray-300 hover:border-gray-500 hover:text-white disabled:opacity-40 transition-colors"
-							>
-								rerun this code
-							</button>
-							<button
-								onclick={deleteSelectedExperiment}
-								disabled={running || importing}
-								class="rounded border border-red-900 px-2 py-1 font-mono text-[10px] text-red-300 hover:border-red-700 hover:text-red-200 disabled:opacity-40 transition-colors"
-							>
-								delete this run
-							</button>
-						</div>
-					{:else if running}
-						<div class="flex items-center gap-2 font-mono text-xs">
-							<span class="px-1 py-0.5 rounded text-[10px] bg-blue-900/50 text-blue-300 animate-pulse">
-								{waitingForRecommendation ? 'thinking' : 'running'}
-							</span>
-							<span class="text-gray-200">
-								{waitingForRecommendation ? 'Claude writing code...' : currentRunName || 'training...'}
-							</span>
-						</div>
-						{#if currentReasoning && !waitingForRecommendation}
-							<p class="text-[11px] text-gray-400 font-mono line-clamp-2" title={currentReasoning}>{currentReasoning}</p>
-						{/if}
-						<p class="text-[11px] text-gray-500 font-mono">{status}</p>
-					{:else}
-						<h2 class="text-xs font-mono text-gray-400">loss</h2>
-					{/if}
-					<div class="h-44 shrink-0">
-						<LossChart data={lossData} pastRuns={pastLossRuns} />
-					</div>
-
-					<!-- Inference -->
-					{#if hasAnyModel}
-					<div class="border-t border-gray-800 pt-2 flex flex-col min-h-0 flex-1 gap-1.5">
-						<h2 class="text-xs font-mono text-gray-400 shrink-0">inference</h2>
-						<div class="flex items-center gap-2 shrink-0">
-							<input
-								type="text"
-								bind:value={prompt}
-								placeholder="prompt..."
-								disabled={!selectedExpId || sampling}
-								class="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40"
-								onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter') generateSample(); }}
-							/>
-							<input type="number" bind:value={temperature} min={0.1} max={2} step={0.1}
-								disabled={!selectedExpId || sampling}
-								class="w-12 bg-gray-800 border border-gray-700 rounded px-1 py-1 text-right tabular-nums text-xs text-gray-200 font-mono disabled:opacity-40"
-								title="temperature" />
-							<button onclick={generateSample} disabled={!selectedExpId || sampling}
-								class="rounded bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 px-3 py-1 font-mono text-xs transition-colors">
-								{#if sampling}
-									<svg class="animate-spin h-3.5 w-3.5 text-gray-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-										<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-										<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
-									</svg>
+			<div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_280px] gap-4">
+				<div class="flex flex-col gap-4 min-w-0">
+					<div class="rounded border border-gray-800 bg-gray-950/60 p-3 space-y-3">
+						<div class="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+							<div class="flex items-center gap-3">
+								<div class="flex rounded border border-gray-700 text-xs font-mono overflow-hidden">
+									<button
+										class="px-2.5 py-0.5 {mode === 'manual' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}"
+										onclick={() => (mode = 'manual')}
+										disabled={running}
+									>manual</button>
+									<button
+										class="px-2.5 py-0.5 {mode === 'research' ? 'bg-blue-700 text-white' : 'text-gray-400 hover:text-white'}"
+										onclick={() => (mode = 'research')}
+										disabled={running}
+									>auto</button>
+								</div>
+								<p class="text-[11px] font-mono text-gray-500">{status}</p>
+							</div>
+							<div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-end md:flex-1">
+								{#if mode === 'manual'}
+									<input
+										type="text"
+										bind:value={experimentName}
+										placeholder="experiment name..."
+										disabled={running}
+										class="w-full md:w-56 bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40"
+									/>
+								{/if}
+								<button
+									onclick={() => (code = BASELINE_CODE)}
+									disabled={running}
+									class="rounded border border-gray-700 px-3 py-1.5 text-[10px] font-mono text-gray-400 hover:text-white hover:border-gray-500 disabled:opacity-30"
+								>reset code</button>
+								{#if running}
+									<button onclick={stopCurrentRun}
+										class="rounded bg-red-600 hover:bg-red-500 px-3 py-1.5 font-mono text-xs transition-colors">
+										{mode === 'manual' ? 'stop training' : 'stop'}
+									</button>
+								{:else if mode === 'manual'}
+									<button onclick={startManualTraining}
+										disabled={status === 'loading data...' || importing}
+										class="rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors">
+										run train.ts
+									</button>
 								{:else}
-									go
+									<button onclick={startResearch}
+										disabled={status === 'loading data...' || importing}
+										class="rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 font-mono text-xs transition-colors">
+										start research
+									</button>
 								{/if}
-							</button>
+							</div>
 						</div>
-						<div class="flex-1 min-h-0 overflow-y-auto">
-							{#if sampling && streamingOutput}
-								<pre class="text-xs text-gray-300 whitespace-pre-wrap break-all font-mono leading-relaxed">{streamingOutput}<span class="animate-pulse">▌</span></pre>
-							{:else if currentInference}
-								{#if inferences.length > 1}
-									<div class="flex items-center justify-end text-xs font-mono text-gray-500 mb-1">
-										<div class="flex items-center gap-1">
-											<button onclick={() => { inferenceIdx = Math.min(inferenceIdx + 1, inferences.length - 1); }}
-												disabled={inferenceIdx >= inferences.length - 1} class="px-1 hover:text-gray-300 disabled:opacity-30">←</button>
-											<span>{inferences.length - inferenceIdx}/{inferences.length}</span>
-											<button onclick={() => { inferenceIdx = Math.max(inferenceIdx - 1, 0); }}
-												disabled={inferenceIdx <= 0} class="px-1 hover:text-gray-300 disabled:opacity-30">→</button>
-										</div>
-									</div>
+
+						<div class="rounded border border-gray-800 bg-black/20 p-3 min-h-[6.5rem]">
+							{#if selectedExp}
+								<div class="flex items-center gap-2 font-mono text-xs">
+									<span class="px-1 py-0.5 rounded text-[10px] {selectedExp.source === 'auto' ? 'bg-blue-900/50 text-blue-300' : 'bg-gray-700 text-gray-300'}">
+										{selectedExp.source === 'auto' ? 'auto' : 'manual'}
+									</span>
+									<span class="text-gray-200">{selectedExp.name}</span>
+									<span class="text-gray-500 tabular-nums ml-auto">{selectedExp.valBpb.toFixed(4)} bpb</span>
+								</div>
+								{#if selectedExp.rerunOf || selectedExp.benchmarkGroup}
+									<p class="mt-2 text-[10px] text-amber-300 font-mono">
+										{#if selectedExp.rerunOf}rerun of #{selectedExp.rerunOf}{/if}
+										{#if selectedExp.rerunOf && selectedExp.benchmarkGroup} · {/if}
+										{#if selectedExp.benchmarkGroup}baseline {selectedExp.benchmarkGroup}{/if}
+									</p>
 								{/if}
-								<pre class="text-xs text-gray-300 whitespace-pre-wrap break-all font-mono leading-relaxed">{currentInference.output}</pre>
+								{#if selectedExp.reasoning}
+									<p class="mt-2 text-[11px] text-gray-400 font-mono line-clamp-2" title={selectedExp.reasoning}>{selectedExp.reasoning}</p>
+								{/if}
+								{#if selectedExp.error}
+									<p class="mt-2 text-[11px] text-red-400 font-mono line-clamp-2">error: {selectedExp.error}</p>
+								{/if}
+								<div class="mt-3 flex items-center gap-2">
+									<button
+										onclick={rerunSelectedExperiment}
+										disabled={running || importing}
+										class="rounded border border-gray-700 px-2 py-1 font-mono text-[10px] text-gray-300 hover:border-gray-500 hover:text-white disabled:opacity-40 transition-colors"
+									>
+										rerun this code
+									</button>
+									<button
+										onclick={deleteSelectedExperiment}
+										disabled={running || importing}
+										class="rounded border border-red-900 px-2 py-1 font-mono text-[10px] text-red-300 hover:border-red-700 hover:text-red-200 disabled:opacity-40 transition-colors"
+									>
+										delete this run
+									</button>
+								</div>
+							{:else if running}
+								<div class="flex items-center gap-2 font-mono text-xs">
+									<span class="px-1 py-0.5 rounded text-[10px] bg-blue-900/50 text-blue-300 animate-pulse">
+										{waitingForRecommendation ? 'thinking' : 'running'}
+									</span>
+									<span class="text-gray-200">
+										{waitingForRecommendation ? 'Claude writing code...' : currentRunName || 'training...'}
+									</span>
+								</div>
+								{#if currentReasoning && !waitingForRecommendation}
+									<p class="mt-2 text-[11px] text-gray-400 font-mono line-clamp-2" title={currentReasoning}>{currentReasoning}</p>
+								{/if}
+								<p class="mt-2 text-[11px] text-gray-500 font-mono">{status}</p>
+							{:else}
+								<div class="space-y-1">
+									<h2 class="text-xs font-mono text-gray-400">workspace</h2>
+									<p class="text-[11px] font-mono text-gray-500">
+										Use the tabs below to inspect the loss chart, edit the training code, or run inference on the selected experiment.
+									</p>
+								</div>
 							{/if}
 						</div>
 					</div>
-					{/if}
-				</div>
-			</div>
 
-			<!-- Right: leaderboard -->
-			<div class="flex flex-col md:h-full md:overflow-hidden">
+					<div class="rounded border border-gray-800 bg-gray-950/60 flex flex-col min-h-[34rem] xl:h-[calc(100vh-26rem)] overflow-hidden">
+						<div class="border-b border-gray-800 px-3 pt-3">
+							<div class="flex items-center gap-2">
+								<button
+									type="button"
+									onclick={() => (workspaceTab = 'chart')}
+									class="rounded-t border border-b-0 px-3 py-1.5 text-xs font-mono transition-colors {workspaceTab === 'chart' ? 'border-gray-700 bg-gray-900 text-white' : 'border-transparent text-gray-500 hover:text-gray-300'}"
+								>chart</button>
+								<button
+									type="button"
+									onclick={() => (workspaceTab = 'code')}
+									class="rounded-t border border-b-0 px-3 py-1.5 text-xs font-mono transition-colors {workspaceTab === 'code' ? 'border-gray-700 bg-gray-900 text-white' : 'border-transparent text-gray-500 hover:text-gray-300'}"
+								>code</button>
+								<button
+									type="button"
+									onclick={() => (workspaceTab = 'inference')}
+									class="rounded-t border border-b-0 px-3 py-1.5 text-xs font-mono transition-colors {workspaceTab === 'inference' ? 'border-gray-700 bg-gray-900 text-white' : 'border-transparent text-gray-500 hover:text-gray-300'}"
+								>inference</button>
+							</div>
+						</div>
+
+						<div class="flex-1 min-h-0 p-3">
+							{#if workspaceTab === 'chart'}
+								<div class="h-full flex flex-col gap-3">
+									<div class="flex items-center justify-between">
+										<h2 class="text-xs font-mono text-gray-400">loss</h2>
+										{#if selectedExp}
+											<span class="text-[10px] font-mono text-gray-500 tabular-nums">
+												{selectedExp.totalSteps} steps · {(selectedExp.elapsed / 1000).toFixed(1)}s
+											</span>
+										{/if}
+									</div>
+									<div class="flex-1 min-h-0 rounded border border-gray-800 bg-black/20 p-3">
+										<LossChart data={lossData} pastRuns={pastLossRuns} />
+									</div>
+								</div>
+							{:else if workspaceTab === 'code'}
+								<div class="h-full flex flex-col min-h-0">
+									<div class="flex items-center justify-between mb-2 shrink-0">
+										<h2 class="text-xs font-mono text-gray-400">train.ts</h2>
+										<span class="text-[10px] font-mono text-gray-500">
+											{running && mode === 'research' ? 'locked during auto runs' : 'editable'}
+										</span>
+									</div>
+									<div class="flex-1 min-h-0">
+										<CodeEditor bind:value={code} disabled={running && mode === 'research'} />
+									</div>
+								</div>
+							{:else}
+								<div class="h-full flex flex-col min-h-0 gap-2">
+									<div class="flex items-center justify-between gap-3 shrink-0">
+										<h2 class="text-xs font-mono text-gray-400">inference</h2>
+										{#if selectedExp}
+											<span class="text-[10px] font-mono text-gray-500">selected #{selectedExp.id}</span>
+										{/if}
+									</div>
+									{#if hasAnyModel}
+										<div class="flex items-center gap-2 shrink-0">
+											<input
+												type="text"
+												bind:value={prompt}
+												placeholder="prompt..."
+												disabled={!selectedExpId || sampling}
+												class="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 font-mono text-xs text-gray-200 placeholder-gray-500 disabled:opacity-40"
+												onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter') generateSample(); }}
+											/>
+											<input type="number" bind:value={temperature} min={0.1} max={2} step={0.1}
+												disabled={!selectedExpId || sampling}
+												class="w-12 bg-gray-800 border border-gray-700 rounded px-1 py-1 text-right tabular-nums text-xs text-gray-200 font-mono disabled:opacity-40"
+												title="temperature" />
+											<button onclick={generateSample} disabled={!selectedExpId || sampling}
+												class="rounded bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 px-3 py-1 font-mono text-xs transition-colors">
+												{#if sampling}
+													<svg class="animate-spin h-3.5 w-3.5 text-gray-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+														<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+														<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+													</svg>
+												{:else}
+													go
+												{/if}
+											</button>
+										</div>
+										<div class="flex-1 min-h-0 overflow-y-auto rounded border border-gray-800 bg-black/20 p-3">
+											{#if sampling && streamingOutput}
+												<pre class="text-xs text-gray-300 whitespace-pre-wrap break-all font-mono leading-relaxed">{streamingOutput}<span class="animate-pulse">▌</span></pre>
+											{:else if currentInference}
+												{#if inferences.length > 1}
+													<div class="flex items-center justify-end text-xs font-mono text-gray-500 mb-1">
+														<div class="flex items-center gap-1">
+															<button onclick={() => { inferenceIdx = Math.min(inferenceIdx + 1, inferences.length - 1); }}
+																disabled={inferenceIdx >= inferences.length - 1} class="px-1 hover:text-gray-300 disabled:opacity-30">←</button>
+															<span>{inferences.length - inferenceIdx}/{inferences.length}</span>
+															<button onclick={() => { inferenceIdx = Math.max(inferenceIdx - 1, 0); }}
+																disabled={inferenceIdx <= 0} class="px-1 hover:text-gray-300 disabled:opacity-30">→</button>
+														</div>
+													</div>
+												{/if}
+												<pre class="text-xs text-gray-300 whitespace-pre-wrap break-all font-mono leading-relaxed">{currentInference.output}</pre>
+											{:else}
+												<div class="h-full flex items-center justify-center text-center">
+													<p class="text-[11px] font-mono text-gray-500 max-w-sm">
+														Select an experiment with saved weights, then sample from it here.
+													</p>
+												</div>
+											{/if}
+										</div>
+									{:else}
+										<div class="flex-1 min-h-0 rounded border border-gray-800 bg-black/20 flex items-center justify-center text-center p-6">
+											<p class="text-[11px] font-mono text-gray-500 max-w-sm">
+												Train or import experiments first, then select one to use the inference workspace.
+											</p>
+										</div>
+									{/if}
+								</div>
+							{/if}
+						</div>
+					</div>
+				</div>
+
+				<!-- Right: leaderboard -->
+				<div class="flex flex-col xl:h-[calc(100vh-20rem)] xl:overflow-hidden">
 				<div class="rounded border border-gray-800 p-3 flex flex-col flex-1 min-h-0">
-					<div class="flex items-center justify-between mb-2 shrink-0">
-						<div class="flex items-center gap-1 text-xs font-mono">
-							<button class="{listMode === 'leaderboard' ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}"
-								onclick={() => setListMode('leaderboard')}>leaderboard</button>
-							<span class="text-gray-600">/</span>
-							<button class="{listMode === 'current' ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}"
-								onclick={() => setListMode('current')}>history</button>
+					<div class="mb-2 shrink-0 space-y-2">
+						<div class="flex items-center justify-between gap-3">
+							<div class="flex items-center gap-1 text-xs font-mono">
+								<button class="{listMode === 'leaderboard' ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}"
+									onclick={() => setListMode('leaderboard')}>leaderboard</button>
+								<span class="text-gray-600">/</span>
+								<button class="{listMode === 'current' ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}"
+									onclick={() => setListMode('current')}>history</button>
+							</div>
+							<div class="flex items-center gap-2 text-[10px] font-mono text-gray-500">
+								<span>{experiments.length} runs</span>
+								<button
+									onclick={() => {
+										selectionMode = !selectionMode;
+										if (!selectionMode) clearBatchSelection();
+									}}
+									disabled={running || importing}
+									class="{selectionMode ? 'text-blue-300' : 'text-gray-500 hover:text-gray-300'} disabled:opacity-40"
+								>
+									{selectionMode ? 'done' : 'select'}
+								</button>
+							</div>
 						</div>
-						<div class="flex items-center gap-2">
-							<button
-								onclick={() => {
-									selectionMode = !selectionMode;
-									if (!selectionMode) clearBatchSelection();
-								}}
-								disabled={running || importing}
-								class="text-[10px] font-mono {selectionMode ? 'text-blue-300' : 'text-gray-500 hover:text-gray-300'} disabled:opacity-40"
-							>
-								{selectionMode ? 'done' : 'select'}
-							</button>
-							<span class="text-gray-500 text-[10px] font-mono">{experiments.length}</span>
-						</div>
+						<select
+							bind:value={leaderboardSort}
+							class="w-full rounded border border-gray-800 bg-black/40 px-2 py-1 text-[10px] font-mono text-gray-400"
+							title="sort experiments"
+						>
+							<option value="bpb">sort: bpb</option>
+							<option value="name">sort: a-z</option>
+							<option value="newest">sort: newest</option>
+							<option value="oldest">sort: oldest</option>
+							<option value="steps">sort: steps</option>
+						</select>
 					</div>
 					{#if selectionMode}
 						<div class="mb-2 flex items-center gap-2 text-[10px] font-mono text-gray-500">
@@ -934,7 +1038,7 @@
 					<div class="flex-1 min-h-0 overflow-y-auto">
 						<Leaderboard experiments={allExperiments} onSelect={selectExperiment}
 							selected={selectedExp}
-							sortByLoss={listMode === 'leaderboard'}
+							sortMode={leaderboardSort}
 							selectionEnabled={selectionMode}
 							selectedIds={selectedBatchIds}
 							onToggleBatchSelect={toggleBatchSelection} />
@@ -952,6 +1056,7 @@
 					</div>
 				</div>
 			</div>
+		</div>
 		</div>
 		{/if}
 	{/if}
