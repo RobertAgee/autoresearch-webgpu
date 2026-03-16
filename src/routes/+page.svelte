@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { initWebGPU, type WebGPUStatus } from '$lib/webgpu';
 	import { DataLoader } from '$lib/data/loader';
-	import { executeTrainCode } from '$lib/research/sandbox';
+	import { executeTrainCode, type RunResult } from '$lib/research/sandbox';
 	import type { StepMetrics, ForwardFn, Params } from '$lib/prepare';
 	import { sampleText } from '$lib/sample';
 	import { ResearchController } from '$lib/research/controller';
@@ -10,7 +10,7 @@
 	import { BASELINE_CODE } from '$lib/research/baseline';
 	import {
 		getDb, insertExperiment, insertInference, insertLossCurve,
-		getBestExperiment, getInferencesForExperiment, clearAllData,
+		getBestExperiment, getInferencesForExperiment, clearAllData, deleteExperiments,
 		exportCsvZip, importCsvZip, updateWeightsPath, getAllExperimentRecords, type InferenceRow
 	} from '$lib/db';
 	import { saveWeights, loadWeights } from '$lib/weights';
@@ -54,6 +54,8 @@
 	let selectedResearchProfileId = $state<string | null>(null);
 	let importing = $state(false);
 	let importInput = $state<HTMLInputElement | null>(null);
+	let selectionMode = $state(false);
+	let selectedBatchIds = $state<number[]>([]);
 
 	// In-memory loaded model state for inference
 	type LoadedModel = { forward: ForwardFn; params: Params; vocabSize: number; seqLen: number; expId: number };
@@ -61,6 +63,9 @@
 
 	let allExperiments = $derived(
 		inProgressExp ? [...experiments, inProgressExp] : experiments
+	);
+	let selectedBatchExperiments = $derived(
+		experiments.filter((exp) => selectedBatchIds.includes(exp.id))
 	);
 
 	let pastLossRuns = $derived(
@@ -127,93 +132,287 @@
 		}
 	}
 
-	async function startManualTraining() {
-		if (!trainLoader || !valLoader || running) return;
+	function makeBenchmarkGroupLabel() {
+		return new Date().toISOString().replace('T', ' ').slice(0, 19);
+	}
 
-		running = true;
+	function clearBatchSelection() {
+		selectedBatchIds = [];
+	}
+
+	function toggleBatchSelection(expId: number) {
+		selectedBatchIds = selectedBatchIds.includes(expId)
+			? selectedBatchIds.filter((id) => id !== expId)
+			: [...selectedBatchIds, expId];
+	}
+
+	type LocalRunRequest = {
+		name: string;
+		source: 'manual' | 'auto';
+		code: string;
+		reasoning: string;
+		rerunOf?: number | null;
+		benchmarkGroup?: string | null;
+		saveWeights?: boolean;
+		generateSample?: boolean;
+		timeoutMs?: number;
+	};
+
+	type LocalRunOutcome = {
+		record: ExperimentRecord;
+		result: RunResult;
+		dbId: number;
+	};
+
+	async function runLocalExperiment(request: LocalRunRequest): Promise<LocalRunOutcome> {
+		if (!trainLoader || !valLoader) {
+			throw new Error('training data is not ready');
+		}
+
 		lossData = [];
 		inferences = [];
 		inferenceIdx = 0;
-		status = 'training...';
-		currentRunName = experimentName || petname();
-		currentReasoning = '';
+		currentRunName = request.name;
+		currentReasoning = request.reasoning;
+		status = request.rerunOf
+			? `rerunning #${request.rerunOf}...`
+			: 'training...';
 		trainAbort = new AbortController();
-		setListMode('current');
-
-		const runCode = code;
 
 		inProgressExp = {
-			id: -1, name: currentRunName, source: 'manual', code: runCode,
-			valBpb: Infinity, elapsed: 0, totalSteps: 0, reasoning: '', kept: false,
+			id: -1,
+			name: request.name,
+			source: request.source,
+			code: request.code,
+			valBpb: Infinity,
+			elapsed: 0,
+			totalSteps: 0,
+			reasoning: request.reasoning,
+			kept: false,
+			rerunOf: request.rerunOf ?? null,
+			benchmarkGroup: request.benchmarkGroup ?? null
 		};
 
-		const result = await executeTrainCode(runCode, trainLoader, valLoader, 30, {
+		const result = await executeTrainCode(request.code, trainLoader, valLoader, 30, {
 			signal: trainAbort.signal,
+			timeoutMs: request.timeoutMs,
 			onStep(m: StepMetrics) {
 				lossData = [...lossData, { step: m.step, loss: m.loss }];
 				status = `step ${m.step} | loss ${m.loss.toFixed(4)} | ${(m.elapsed / 1000).toFixed(1)}s`;
 				if (inProgressExp) {
-					inProgressExp = { ...inProgressExp, valBpb: m.loss, totalSteps: m.step, elapsed: m.elapsed };
+					inProgressExp = {
+						...inProgressExp,
+						valBpb: m.loss,
+						totalSteps: m.step,
+						elapsed: m.elapsed
+					};
 				}
 			}
 		});
 		trainAbort = null;
 		inProgressExp = null;
 
-		// Store forward fn for inference
-		loadedModel = {
-			forward: result.forward,
-			params: result.params,
-			vocabSize: result.vocabSize,
-			seqLen: result.seqLen,
-			expId: -1, // updated after DB insert
-		};
-
-		const kept = experiments.length === 0 || result.valBpb < Math.min(...experiments.map(e => e.valBpb));
-
+		const kept = experiments.length === 0 || result.valBpb < Math.min(...experiments.map((e) => e.valBpb));
 		const dbId = await insertExperiment({
-			name: currentRunName,
-			source: 'manual',
-			code: runCode,
+			name: request.name,
+			source: request.source,
+			code: request.code,
 			valBpb: result.valBpb,
 			elapsed: result.elapsed,
 			totalSteps: result.totalSteps,
-			reasoning: result.error || 'Manual run',
+			reasoning: request.reasoning,
 			kept,
 			lossCurve: lossData,
 			error: result.error,
+			rerunOf: request.rerunOf ?? null,
+			benchmarkGroup: request.benchmarkGroup ?? null
 		});
 
-		loadedModel = { ...loadedModel, expId: dbId };
 		await insertLossCurve(dbId, lossData);
-		await loadFromDb();
-		selectExperimentById(dbId);
-		status = result.error
-			? `error: ${result.error}`
-			: `done — val_bpb: ${result.valBpb.toFixed(4)} | ${result.totalSteps} steps`;
-		running = false;
-		experimentName = petname();
 
-		// Save weights in background
-		if (result.params && Object.keys(result.params).length > 0) {
+		if (!result.error) {
+			loadedModel = {
+				forward: result.forward,
+				params: result.params,
+				vocabSize: result.vocabSize,
+				seqLen: result.seqLen,
+				expId: dbId
+			};
+		}
+
+		if (request.saveWeights && result.params && Object.keys(result.params).length > 0) {
 			(async () => {
 				try {
 					const weightsPath = await saveWeights(dbId, result.params);
 					await updateWeightsPath(dbId, weightsPath);
-				} catch (e) { console.error('Failed to save weights:', e); }
-				// Generate sample
-				if (loadedModel?.forward) {
+				} catch (e) {
+					console.error('Failed to save weights:', e);
+				}
+
+				if (request.generateSample && loadedModel?.forward && loadedModel.expId === dbId) {
 					try {
-						const output = await sampleText(result.params, loadedModel.forward, result.vocabSize, result.seqLen, '', 200, 0.8);
+						const output = await sampleText(
+							result.params,
+							loadedModel.forward,
+							result.vocabSize,
+							result.seqLen,
+							'',
+							200,
+							0.8
+						);
 						await insertInference({ experimentId: dbId, prompt: '', output, temperature: 0.8 });
 						if (selectedExpId === dbId) {
 							inferences = await getInferencesForExperiment(dbId);
 							inferenceIdx = 0;
 						}
-					} catch (e) { console.error('Failed to generate sample:', e); }
+					} catch (e) {
+						console.error('Failed to generate sample:', e);
+					}
 				}
 			})();
 		}
+
+		return {
+			dbId,
+			result,
+			record: {
+				id: dbId,
+				name: request.name,
+				source: request.source,
+				code: request.code,
+				valBpb: result.valBpb,
+				elapsed: result.elapsed,
+				totalSteps: result.totalSteps,
+				reasoning: request.reasoning,
+				kept,
+				error: result.error,
+				lossCurve: lossData,
+				rerunOf: request.rerunOf ?? null,
+				benchmarkGroup: request.benchmarkGroup ?? null
+			}
+		};
+	}
+
+	async function startManualTraining() {
+		if (!trainLoader || !valLoader || running) return;
+
+		running = true;
+		setListMode('current');
+
+		try {
+			const runName = experimentName || petname();
+			const outcome = await runLocalExperiment({
+				name: runName,
+				source: 'manual',
+				code,
+				reasoning: 'Manual run',
+				saveWeights: true,
+				generateSample: true
+			});
+			await loadFromDb();
+			selectExperimentById(outcome.dbId);
+			status = outcome.result.error
+				? `error: ${outcome.result.error}`
+				: `done — val_bpb: ${outcome.result.valBpb.toFixed(4)} | ${outcome.result.totalSteps} steps`;
+			experimentName = petname();
+		} finally {
+			running = false;
+		}
+	}
+
+	async function rerunExperiments(targets: ExperimentRecord[]) {
+		if (!trainLoader || !valLoader || running || targets.length === 0) return;
+
+		running = true;
+		setListMode('current');
+		const benchmarkGroup = makeBenchmarkGroupLabel();
+		const saveWeights = targets.length === 1;
+		let completed = 0;
+		let failures = 0;
+		let lastDbId: number | null = null;
+
+		try {
+			for (const exp of targets) {
+				const outcome = await runLocalExperiment({
+					name: exp.name,
+					source: exp.source,
+					code: exp.code,
+					reasoning: `Benchmark rerun of #${exp.id}${exp.reasoning ? ` — ${exp.reasoning}` : ''}`,
+					rerunOf: exp.id,
+					benchmarkGroup,
+					saveWeights,
+					generateSample: false,
+					timeoutMs: 180000
+				});
+				completed += 1;
+				if (outcome.result.error) failures += 1;
+				lastDbId = outcome.dbId;
+				await loadFromDb();
+
+				if (outcome.result.error?.toLowerCase().includes('aborted')) {
+					status = `stopped after ${completed}/${targets.length} reruns in ${benchmarkGroup}`;
+					return;
+				}
+			}
+
+			if (lastDbId != null) {
+				selectExperimentById(lastDbId);
+			}
+			status = failures > 0
+				? `reran ${completed} experiments in baseline ${benchmarkGroup} (${failures} failed)`
+				: `reran ${completed} experiment${completed === 1 ? '' : 's'} in baseline ${benchmarkGroup}`;
+		} finally {
+			running = false;
+			clearBatchSelection();
+			selectionMode = false;
+		}
+	}
+
+	async function rerunSelectedExperiment() {
+		if (!selectedExp) return;
+		await rerunExperiments([selectedExp]);
+	}
+
+	async function rerunSelectedBatch() {
+		if (selectedBatchExperiments.length === 0) return;
+		await rerunExperiments(selectedBatchExperiments);
+	}
+
+	async function rerunAllExperiments() {
+		const originals = experiments.filter((exp) => !exp.rerunOf);
+		if (originals.length === 0) return;
+		await rerunExperiments(originals);
+	}
+
+	async function deleteExperimentRecords(ids: number[], scopeLabel: string) {
+		if (ids.length === 0 || running || importing) return;
+
+		const confirmed = window.confirm(
+			`Delete ${scopeLabel}? This removes the experiment rows, their loss curves, inferences, and any saved weights for those runs.`
+		);
+		if (!confirmed) return;
+
+		const selectedIdBeforeDelete = selectedExpId;
+		const deletedCount = await deleteExperiments(ids);
+		await loadFromDb();
+
+		selectedBatchIds = selectedBatchIds.filter((id) => !ids.includes(id));
+		if (selectedIdBeforeDelete != null && ids.includes(selectedIdBeforeDelete)) {
+			setSelectedExp(null);
+			code = experiments.length > 0 ? code : BASELINE_CODE;
+		}
+
+		status = `deleted ${deletedCount} experiment${deletedCount === 1 ? '' : 's'}`;
+	}
+
+	async function deleteSelectedExperiment() {
+		if (!selectedExp) return;
+		await deleteExperimentRecords([selectedExp.id], `experiment #${selectedExp.id}`);
+	}
+
+	async function deleteSelectedBatch() {
+		if (selectedBatchIds.length === 0) return;
+		await deleteExperimentRecords(selectedBatchIds, `${selectedBatchIds.length} selected experiments`);
 	}
 
 	async function startResearch() {
@@ -392,6 +591,8 @@
 		experiments = [];
 		code = BASELINE_CODE;
 		setSelectedExp(null);
+		clearBatchSelection();
+		selectionMode = false;
 		inferences = [];
 		loadedModel = null;
 	}
@@ -590,12 +791,35 @@
 							<span class="text-gray-200">{selectedExp.name}</span>
 							<span class="text-gray-500 tabular-nums ml-auto">{selectedExp.valBpb.toFixed(4)} bpb</span>
 						</div>
+						{#if selectedExp.rerunOf || selectedExp.benchmarkGroup}
+							<p class="text-[10px] text-amber-300 font-mono">
+								{#if selectedExp.rerunOf}rerun of #{selectedExp.rerunOf}{/if}
+								{#if selectedExp.rerunOf && selectedExp.benchmarkGroup} · {/if}
+								{#if selectedExp.benchmarkGroup}baseline {selectedExp.benchmarkGroup}{/if}
+							</p>
+						{/if}
 						{#if selectedExp.reasoning}
 							<p class="text-[11px] text-gray-400 font-mono line-clamp-2" title={selectedExp.reasoning}>{selectedExp.reasoning}</p>
 						{/if}
 						{#if selectedExp.error}
 							<p class="text-[11px] text-red-400 font-mono line-clamp-2">error: {selectedExp.error}</p>
 						{/if}
+						<div class="flex items-center gap-2">
+							<button
+								onclick={rerunSelectedExperiment}
+								disabled={running || importing}
+								class="rounded border border-gray-700 px-2 py-1 font-mono text-[10px] text-gray-300 hover:border-gray-500 hover:text-white disabled:opacity-40 transition-colors"
+							>
+								rerun this code
+							</button>
+							<button
+								onclick={deleteSelectedExperiment}
+								disabled={running || importing}
+								class="rounded border border-red-900 px-2 py-1 font-mono text-[10px] text-red-300 hover:border-red-700 hover:text-red-200 disabled:opacity-40 transition-colors"
+							>
+								delete this run
+							</button>
+						</div>
 					{:else if running}
 						<div class="flex items-center gap-2 font-mono text-xs">
 							<span class="px-1 py-0.5 rounded text-[10px] bg-blue-900/50 text-blue-300 animate-pulse">
@@ -679,12 +903,41 @@
 							<button class="{listMode === 'current' ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}"
 								onclick={() => setListMode('current')}>history</button>
 						</div>
-						<span class="text-gray-500 text-[10px] font-mono">{experiments.length}</span>
+						<div class="flex items-center gap-2">
+							<button
+								onclick={() => {
+									selectionMode = !selectionMode;
+									if (!selectionMode) clearBatchSelection();
+								}}
+								disabled={running || importing}
+								class="text-[10px] font-mono {selectionMode ? 'text-blue-300' : 'text-gray-500 hover:text-gray-300'} disabled:opacity-40"
+							>
+								{selectionMode ? 'done' : 'select'}
+							</button>
+							<span class="text-gray-500 text-[10px] font-mono">{experiments.length}</span>
+						</div>
 					</div>
+					{#if selectionMode}
+						<div class="mb-2 flex items-center gap-2 text-[10px] font-mono text-gray-500">
+							<span>{selectedBatchIds.length} selected</span>
+							<button onclick={rerunSelectedBatch} disabled={running || importing || selectedBatchIds.length === 0} class="text-gray-400 hover:text-white disabled:opacity-40">
+								rerun selected
+							</button>
+							<button onclick={deleteSelectedBatch} disabled={running || importing || selectedBatchIds.length === 0} class="text-red-400 hover:text-red-200 disabled:opacity-40">
+								delete selected
+							</button>
+							<button onclick={clearBatchSelection} disabled={selectedBatchIds.length === 0} class="text-gray-500 hover:text-gray-300 disabled:opacity-40">
+								clear selection
+							</button>
+						</div>
+					{/if}
 					<div class="flex-1 min-h-0 overflow-y-auto">
 						<Leaderboard experiments={allExperiments} onSelect={selectExperiment}
 							selected={selectedExp}
-							sortByLoss={listMode === 'leaderboard'} />
+							sortByLoss={listMode === 'leaderboard'}
+							selectionEnabled={selectionMode}
+							selectedIds={selectedBatchIds}
+							onToggleBatchSelect={toggleBatchSelection} />
 					</div>
 					<div class="flex gap-3 mt-2 pt-2 border-t border-gray-800 shrink-0">
 						<input bind:this={importInput} type="file" accept=".zip,application/zip" class="hidden" onchange={handleImportFile} />
@@ -692,6 +945,7 @@
 							{importing ? 'importing...' : 'import'}
 						</button>
 						{#if experiments.length > 0}
+							<button onclick={rerunAllExperiments} disabled={running || importing} class="text-gray-500 hover:text-gray-300 disabled:opacity-40 text-xs font-mono">rerun all</button>
 							<button onclick={handleExport} class="text-gray-500 hover:text-gray-300 text-xs font-mono">export</button>
 							<button onclick={handleClear} disabled={running} class="text-gray-500 hover:text-red-400 text-xs font-mono">clear</button>
 						{/if}

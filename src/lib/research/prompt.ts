@@ -10,6 +10,9 @@ export type ExperimentRecord = {
 	kept: boolean;
 	error?: string;
 	lossCurve?: { step: number; loss: number }[];
+	rerunOf?: number | null;
+	benchmarkGroup?: string | null;
+	createdAt?: string;
 };
 
 /**

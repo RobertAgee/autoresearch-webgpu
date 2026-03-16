@@ -86,6 +86,15 @@ export async function loadWeights(experimentId: number): Promise<Params | null> 
 	return params;
 }
 
+export async function deleteSavedWeights(experimentId: number): Promise<void> {
+	const targets = [getWeightsPath(experimentId), getWeightsMetaPath(experimentId)];
+	await Promise.all(targets.map(async (path) => {
+		try {
+			await opfs.remove(path);
+		} catch {}
+	}));
+}
+
 export async function clearSavedWeights(): Promise<void> {
 	const files = await opfs.list();
 	const weightFiles = files.filter((file) => file.name.startsWith(WEIGHTS_PREFIX));

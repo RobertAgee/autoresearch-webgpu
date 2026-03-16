@@ -1,5 +1,5 @@
 import { PGlite } from '@electric-sql/pglite';
-import { clearSavedWeights } from './weights';
+import { clearSavedWeights, deleteSavedWeights } from './weights';
 
 let db: PGlite | null = null;
 
@@ -17,6 +17,8 @@ const SCHEMA = `
 		error TEXT,
 		loss_curve JSONB,
 		weights_path TEXT,
+		rerun_of INTEGER REFERENCES experiments(id) ON DELETE SET NULL,
+		benchmark_group TEXT,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 
@@ -39,10 +41,16 @@ const SCHEMA = `
 	);
 `;
 
+const MIGRATIONS = `
+	ALTER TABLE experiments ADD COLUMN IF NOT EXISTS rerun_of INTEGER REFERENCES experiments(id) ON DELETE SET NULL;
+	ALTER TABLE experiments ADD COLUMN IF NOT EXISTS benchmark_group TEXT;
+`;
+
 export async function getDb(): Promise<PGlite> {
 	if (db) return db;
 	db = new PGlite('idb://autoresearch');
 	await db.exec(SCHEMA);
+	await db.exec(MIGRATIONS);
 	return db;
 }
 
@@ -61,6 +69,8 @@ export type ExperimentRow = {
 	error: string | null;
 	loss_curve: { step: number; loss: number }[] | null;
 	weights_path: string | null;
+	rerun_of: number | null;
+	benchmark_group: string | null;
 	created_at: string;
 };
 
@@ -75,12 +85,14 @@ export async function insertExperiment(exp: {
 	kept: boolean;
 	lossCurve?: { step: number; loss: number }[];
 	error?: string;
+	rerunOf?: number | null;
+	benchmarkGroup?: string | null;
 	createdAt?: string;
 }): Promise<number> {
 	const pg = await getDb();
 	const result = await pg.query<{ id: number }>(
-		`INSERT INTO experiments (name, source, code, val_bpb, elapsed, total_steps, reasoning, kept, loss_curve, error, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, NOW()))
+		`INSERT INTO experiments (name, source, code, val_bpb, elapsed, total_steps, reasoning, kept, loss_curve, error, rerun_of, benchmark_group, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, COALESCE($13, NOW()))
 		 RETURNING id`,
 		[
 			exp.name || '',
@@ -93,6 +105,8 @@ export async function insertExperiment(exp: {
 			exp.kept,
 			exp.lossCurve ? JSON.stringify(exp.lossCurve) : null,
 			exp.error || null,
+			exp.rerunOf ?? null,
+			exp.benchmarkGroup ?? null,
 			exp.createdAt || null
 		]
 	);
@@ -118,6 +132,20 @@ export async function updateWeightsPath(id: number, weightsPath: string): Promis
 	await pg.query(`UPDATE experiments SET weights_path = $1 WHERE id = $2`, [weightsPath, id]);
 }
 
+export async function deleteExperiments(ids: number[]): Promise<number> {
+	if (ids.length === 0) return 0;
+
+	const pg = await getDb();
+	await Promise.all(ids.map((id) => deleteSavedWeights(id)));
+
+	const placeholders = ids.map((_, idx) => `$${idx + 1}`).join(', ');
+	const result = await pg.query<{ id: number }>(
+		`DELETE FROM experiments WHERE id IN (${placeholders}) RETURNING id`,
+		ids
+	);
+	return result.rows.length;
+}
+
 export async function clearAllData(): Promise<void> {
 	const pg = await getDb();
 	await clearSavedWeights();
@@ -127,6 +155,7 @@ export async function clearAllData(): Promise<void> {
 		DROP TABLE IF EXISTS experiments;
 	`);
 	await pg.exec(SCHEMA);
+	await pg.exec(MIGRATIONS);
 }
 
 // -- Loss Steps --
@@ -207,7 +236,10 @@ export function rowToRecord(row: ExperimentRow): ExperimentRecord {
 		reasoning: row.reasoning,
 		kept: row.kept,
 		error: row.error ?? undefined,
-		lossCurve: row.loss_curve ?? undefined
+		lossCurve: row.loss_curve ?? undefined,
+		rerunOf: row.rerun_of,
+		benchmarkGroup: row.benchmark_group,
+		createdAt: row.created_at
 	};
 }
 
@@ -271,6 +303,8 @@ type ImportedExperiment = {
 	kept: boolean;
 	error: string | null;
 	loss_curve: { step: number; loss: number }[] | null;
+	rerun_of: number | null;
+	benchmark_group: string | null;
 	created_at: string;
 };
 
@@ -369,7 +403,7 @@ function parseBoolean(value: string): boolean {
 	return value === 'true' || value === 't' || value === '1';
 }
 
-function experimentKey(exp: Pick<ExperimentRow, 'name' | 'source' | 'code' | 'reasoning' | 'val_bpb' | 'elapsed' | 'total_steps' | 'kept' | 'error' | 'created_at'>): string {
+function experimentKey(exp: Pick<ExperimentRow, 'name' | 'source' | 'code' | 'reasoning' | 'val_bpb' | 'elapsed' | 'total_steps' | 'kept' | 'error' | 'rerun_of' | 'benchmark_group' | 'created_at'>): string {
 	return JSON.stringify([
 		exp.name,
 		exp.source,
@@ -380,6 +414,25 @@ function experimentKey(exp: Pick<ExperimentRow, 'name' | 'source' | 'code' | 're
 		exp.total_steps,
 		exp.kept,
 		exp.error ?? null,
+		exp.rerun_of ?? null,
+		exp.benchmark_group ?? null,
+		exp.created_at,
+	]);
+}
+
+function importedExperimentKey(exp: ImportedExperiment, idMap: Map<number, number>): string {
+	return JSON.stringify([
+		exp.name,
+		exp.source,
+		exp.code,
+		exp.reasoning,
+		exp.val_bpb,
+		exp.elapsed,
+		exp.total_steps,
+		exp.kept,
+		exp.error ?? null,
+		exp.rerun_of != null ? idMap.get(exp.rerun_of) ?? null : null,
+		exp.benchmark_group ?? null,
 		exp.created_at,
 	]);
 }
@@ -405,6 +458,8 @@ function parseImportedExperiments(rows: CsvRow[]): ImportedExperiment[] {
 		kept: parseBoolean(row.kept ?? ''),
 		error: row.error ? row.error : null,
 		loss_curve: parseJsonField(row.loss_curve ?? '', null),
+		rerun_of: row.rerun_of ? parseNumber(row.rerun_of, 'experiments.rerun_of') : null,
+		benchmark_group: row.benchmark_group || null,
 		created_at: row.created_at || new Date().toISOString(),
 	}));
 }
@@ -432,8 +487,8 @@ async function insertExperimentsBatch(pg: PGlite, experiments: ImportedExperimen
 
 	const values = experiments
 		.map((_, idx) => {
-			const base = idx * 11;
-			return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, COALESCE($${base + 11}, NOW()))`;
+			const base = idx * 13;
+			return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11}, $${base + 12}, COALESCE($${base + 13}, NOW()))`;
 		})
 		.join(', ');
 
@@ -450,18 +505,48 @@ async function insertExperimentsBatch(pg: PGlite, experiments: ImportedExperimen
 			exp.kept,
 			exp.loss_curve ? JSON.stringify(exp.loss_curve) : null,
 			exp.error,
+			null,
+			exp.benchmark_group,
 			exp.created_at
 		);
 	}
 
 	const result = await pg.query<{ id: number }>(
-		`INSERT INTO experiments (name, source, code, val_bpb, elapsed, total_steps, reasoning, kept, loss_curve, error, created_at)
+		`INSERT INTO experiments (name, source, code, val_bpb, elapsed, total_steps, reasoning, kept, loss_curve, error, rerun_of, benchmark_group, created_at)
 		 VALUES ${values}
 		 RETURNING id`,
 		params
 	);
 
 	return result.rows.map((row) => row.id);
+}
+
+async function updateExperimentLineageBatch(
+	pg: PGlite,
+	rows: { id: number; rerunOf: number | null; benchmarkGroup: string | null }[]
+): Promise<void> {
+	if (rows.length === 0) return;
+
+	const values = rows
+		.map((_, idx) => {
+			const base = idx * 3;
+			return `($${base + 1}, $${base + 2}, $${base + 3})`;
+		})
+		.join(', ');
+
+	const params: unknown[] = [];
+	for (const row of rows) {
+		params.push(row.id, row.rerunOf, row.benchmarkGroup);
+	}
+
+	await pg.query(
+		`UPDATE experiments AS e
+		 SET rerun_of = v.rerun_of,
+		     benchmark_group = v.benchmark_group
+		 FROM (VALUES ${values}) AS v(id, rerun_of, benchmark_group)
+		 WHERE e.id = v.id`,
+		params
+	);
 }
 
 async function insertLossStepsBatch(pg: PGlite, rows: ImportedLossStep[], idMap: Map<number, number>): Promise<number> {
@@ -587,7 +672,7 @@ export async function importCsvZip(file: Blob): Promise<ImportSummary> {
 		const experimentsToInsert: ImportedExperiment[] = [];
 
 		for (const exp of importedExperiments) {
-			const key = experimentKey(exp);
+			const key = importedExperimentKey(exp, idMap);
 			const existingId = existingExperimentKeys.get(key);
 			if (existingId != null) {
 				idMap.set(exp.id, existingId);
@@ -604,9 +689,20 @@ export async function importCsvZip(file: Blob): Promise<ImportSummary> {
 				const exp = batch[i];
 				const insertedId = insertedIds[i];
 				idMap.set(exp.id, insertedId);
-				existingExperimentKeys.set(experimentKey(exp), insertedId);
+				existingExperimentKeys.set(importedExperimentKey(exp, idMap), insertedId);
 				summary.addedExperiments++;
 			}
+		}
+
+		const lineageUpdates = importedExperiments
+			.map((exp) => ({
+				id: idMap.get(exp.id) ?? null,
+				rerunOf: exp.rerun_of != null ? idMap.get(exp.rerun_of) ?? null : null,
+				benchmarkGroup: exp.benchmark_group,
+			}))
+			.filter((row): row is { id: number; rerunOf: number | null; benchmarkGroup: string | null } => row.id != null);
+		for (const batch of chunk(lineageUpdates, 100)) {
+			await updateExperimentLineageBatch(pg, batch);
 		}
 
 		const lossStepsToInsert: ImportedLossStep[] = [];

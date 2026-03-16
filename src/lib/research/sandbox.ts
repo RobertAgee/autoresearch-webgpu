@@ -25,6 +25,7 @@ export async function executeTrainCode(
 	callbacks: {
 		onStep: (m: StepMetrics) => void;
 		signal: AbortSignal;
+		timeoutMs?: number;
 	}
 ): Promise<RunResult> {
 	const prepare = getPrepareGlobals();
@@ -77,10 +78,10 @@ export async function executeTrainCode(
 	let timeoutId: ReturnType<typeof setTimeout> | null = null;
 	const timeoutPromise = new Promise<never>((_, reject) => {
 		// Timeout: 2x the training budget (minimum 30s for model init/inference rebuild)
-		const timeoutMs = Math.max(trainSeconds * 2000, 30000);
+		const timeoutMs = callbacks.timeoutMs ?? Math.max(trainSeconds * 2000, 30000);
 		timeoutId = setTimeout(() => {
 			reject(new Error(`Training exceeded ${timeoutMs / 1000}s timeout`));
-		});
+		}, timeoutMs);
 	});
 
 	try {

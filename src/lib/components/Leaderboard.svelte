@@ -5,12 +5,18 @@
 		experiments,
 		onSelect,
 		selected,
-		sortByLoss = true
+		sortByLoss = true,
+		selectionEnabled = false,
+		selectedIds = [],
+		onToggleBatchSelect
 	}: {
 		experiments: ExperimentRecord[];
 		onSelect?: (exp: ExperimentRecord) => void;
 		selected?: ExperimentRecord | null;
 		sortByLoss?: boolean;
+		selectionEnabled?: boolean;
+		selectedIds?: number[];
+		onToggleBatchSelect?: (expId: number) => void;
 	} = $props();
 
 	let sorted = $derived(
@@ -27,11 +33,26 @@
 
 <div class="space-y-0.5 overflow-y-auto">
 	{#each sorted as exp, i}
-		<button
-			onclick={() => onSelect?.(exp)}
-			class="w-full flex items-center gap-1.5 font-mono text-[11px] px-1.5 py-1 rounded transition-colors
+		<div
+			class="w-full flex items-center gap-1.5 font-mono text-[11px] rounded transition-colors
 				{exp.id === -1 ? 'bg-red-950/50 text-red-300' : selected?.id === exp.id ? 'bg-blue-950/50 text-blue-300' : exp.id === bestId ? 'bg-green-950/50 text-green-300' : 'text-gray-400 hover:bg-gray-800'}"
 		>
+			{#if selectionEnabled && exp.id !== -1}
+				<button
+					type="button"
+					class="ml-1 shrink-0 w-3 h-3 rounded border border-gray-600 text-[9px] leading-none flex items-center justify-center {selectedIds.includes(exp.id) ? 'bg-blue-600 border-blue-500 text-white' : 'text-transparent'}"
+					onclick={() => {
+						onToggleBatchSelect?.(exp.id);
+					}}
+					title={selectedIds.includes(exp.id) ? 'remove from rerun selection' : 'add to rerun selection'}
+				>
+					✓
+				</button>
+			{/if}
+			<button
+				onclick={() => onSelect?.(exp)}
+				class="min-w-0 flex-1 flex items-center gap-1.5 px-1.5 py-1 text-left"
+			>
 			{#if exp.id === -1}
 				<span class="shrink-0 w-3 text-center text-red-400 animate-pulse" title="in progress">*</span>
 			{:else}
@@ -42,8 +63,12 @@
 			<span class="truncate text-left flex-1" title={exp.reasoning}>
 				{exp.name || `#${exp.id}`}
 			</span>
+			{#if exp.rerunOf}
+				<span class="shrink-0 text-[9px] text-amber-400" title={`rerun of #${exp.rerunOf}`}>R</span>
+			{/if}
 			<span class="tabular-nums shrink-0">{exp.id === -1 && exp.valBpb === Infinity ? '...' : exp.valBpb.toFixed(3)}</span>
-		</button>
+			</button>
+		</div>
 	{/each}
 
 	{#if experiments.length === 0}
