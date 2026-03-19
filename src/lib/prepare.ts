@@ -8,6 +8,7 @@ import { numpy as np, nn, random, tree, blockUntilReady, valueAndGrad, jit, vmap
 import { adamw, applyUpdates } from '@jax-js/optax';
 import { DataLoader } from './data/loader';
 import { lrMultiplier } from './train/schedule';
+import { getTrainerDefinition } from './trainers';
 
 export type Params = { [key: string]: np.Array };
 export type ForwardFn = (params: Params, inputIds: np.Array) => np.Array;
@@ -24,6 +25,8 @@ export type TrainResult = {
 	vocabSize: number;
 	batchSize: number;
 	seqLen: number;
+	score?: number;
+	valBpb?: number;
 };
 
 export type TrainCallbacks = {
@@ -75,12 +78,16 @@ async function evaluate(
 }
 
 /** The full set of globals injected into generated code. */
-export function getPrepareGlobals() {
+export function getPrepareGlobals(trainerKey?: string | null) {
+	const trainer = getTrainerDefinition(trainerKey);
 	return {
 		np, nn, random, tree, blockUntilReady, valueAndGrad,
 		jit, vmap, grad,
 		adamw, applyUpdates,
 		evaluate, lrSchedule: lrMultiplier, yieldToUI,
-		VOCAB_SIZE: 256,
+		VOCAB_SIZE: trainer.defaultVocabSize,
+		TRAINER_KEY: trainer.key,
+		METRIC_KEY: trainer.metricKey,
+		METRIC_LABEL: trainer.metricLabel,
 	};
 }

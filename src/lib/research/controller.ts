@@ -1,13 +1,50 @@
 import { DataLoader } from '../data/loader';
-import { executeTrainCode, type RunResult } from './sandbox';
 import type { StepMetrics } from '../prepare';
+import { insertExperiment, insertInference, insertLossCurve, updateWeightsPath } from '../db';
 import { petname } from '../petname';
-import { insertExperiment, insertLossCurve, updateWeightsPath } from '../db';
 import { saveWeights } from '../weights';
-import { buildSystemPrompt, buildUserPrompt, type ExperimentRecord } from './prompt';
-import { BASELINE_CODE } from './baseline';
+import { DEFAULT_TRAINER_KEY } from '$lib/trainers';
+import {
+	BASELINE_RESEARCH_CONFIG,
+	applyResearchProposal,
+	buildTrainCodeFromConfig,
+	extractResearchConfigFromCode,
+	researchPhaseForIteration,
+	normalizeResearchConfig,
+	type ResearchConfig,
+	type ResearchPhase,
+	type ResearchProposal
+} from './config';
+import { evaluateResearchRun, summarizeEvalReport, type EvalReport } from './eval';
+import { buildEvalSummary, type ExperimentEvalSummary } from './metrics';
 import { parseClaudeResponse } from './parse';
+import {
+	buildSystemPrompt,
+	buildUserPrompt,
+	type ExperimentRecord,
+	type ResearchDatasetContext
+} from './prompt';
 import type { ResearchEndpointProfile } from './providers';
+import { executeTrainCode, type RunResult } from './sandbox';
+
+type CandidateSpec = {
+	config: ResearchConfig;
+	reasoning: string;
+	phase: ResearchPhase;
+	changedKeys: (keyof ResearchConfig)[];
+};
+
+type Outcome = {
+	config: ResearchConfig;
+	code: string;
+	reasoning: string;
+	phase: ResearchPhase;
+	stage: 'baseline' | 'quick-screen' | 'full-benchmark' | 'confirmation';
+	changedKeys: (keyof ResearchConfig)[];
+	result: RunResult;
+	lossCurve: { step: number; loss: number }[];
+	report: EvalReport | null;
+};
 
 export type ResearchCallbacks = {
 	onExperimentStart?: (code: string, reasoning: string) => void;
@@ -18,22 +55,69 @@ export type ResearchCallbacks = {
 	onReasoningStream?: (text: string) => void;
 };
 
+function compareNewestFirst(a: ExperimentRecord, b: ExperimentRecord): number {
+	const aTime = a.createdAt ? Date.parse(a.createdAt) : NaN;
+	const bTime = b.createdAt ? Date.parse(b.createdAt) : NaN;
+	return (Number.isFinite(bTime) ? bTime : b.id) - (Number.isFinite(aTime) ? aTime : a.id) || b.id - a.id;
+}
+
+function extractScoreFromReasoning(reasoning: string): number {
+	const match = reasoning.match(/\bscore=([-+]?\d+(?:\.\d+)?)\b/);
+	return match ? Number(match[1]) : Number.NEGATIVE_INFINITY;
+}
+
+function outcomeScore(outcome: Outcome): number {
+	if (outcome.result.error) return Number.NEGATIVE_INFINITY;
+	if (!outcome.report) return -outcome.result.valBpb;
+	if (!outcome.report.gated) return Number.NEGATIVE_INFINITY;
+	return outcome.report.compositeScore;
+}
+
+function stageSeconds(stage: Outcome['stage'], fullSeconds: number): number {
+	switch (stage) {
+		case 'quick-screen':
+			return Math.min(12, fullSeconds);
+		case 'baseline':
+		case 'full-benchmark':
+		case 'confirmation':
+		default:
+			return fullSeconds;
+	}
+}
+
+function keepReasoning(reasoning: string, phase: ResearchPhase, stage: Outcome['stage'], changedKeys: (keyof ResearchConfig)[], report: EvalReport | null): string {
+	const delta = changedKeys.length > 0 ? changedKeys.join(',') : 'baseline';
+	return `${reasoning} | phase=${phase} | stage=${stage} | delta=${delta} | ${summarizeEvalReport(report)}`;
+}
+
 export class ResearchController {
 	history: ExperimentRecord[] = [];
-	bestCode: string = BASELINE_CODE;
+	bestConfig: ResearchConfig = BASELINE_RESEARCH_CONFIG;
+	bestCode: string = buildTrainCodeFromConfig(BASELINE_RESEARCH_CONFIG);
 	bestBpb: number = Infinity;
-	running: boolean = false;
+	bestResearchScore = Number.NEGATIVE_INFINITY;
+	running = false;
 	lastError = '';
 	trainSeconds = 30;
 	profile: ResearchEndpointProfile | null = null;
+	datasetContext: ResearchDatasetContext | null = null;
 	private stopRequested = false;
 	private runAbort: AbortController | null = null;
 	private fetchAbort: AbortController | null = null;
+	private iteration = 0;
 
-	stop() {
+	requestStopAfterCurrentRun() {
+		this.stopRequested = true;
+	}
+
+	stopImmediately() {
 		this.stopRequested = true;
 		this.fetchAbort?.abort();
 		this.runAbort?.abort();
+	}
+
+	stop() {
+		this.stopImmediately();
 	}
 
 	stopCurrentRun() {
@@ -47,104 +131,320 @@ export class ResearchController {
 	) {
 		this.running = true;
 		this.stopRequested = false;
+		this.syncChampionFromHistory();
 
 		if (this.history.length === 0) {
-			await this.runExperiment(
-				this.bestCode,
-				'Baseline run with default architecture.',
-				trainData, valData, callbacks
-			);
+			await this.runBaseline(trainData, valData, callbacks);
 		}
 
 		while (!this.stopRequested) {
-			const proposal = await this.getNextCode(callbacks);
+			const proposal = await this.getNextProposal(callbacks);
+			if (this.stopRequested) break;
 			if (!proposal) {
-				callbacks.onError?.(this.lastError || 'Failed to get next code from the research backend.');
+				callbacks.onError?.(this.lastError || 'Failed to get next config proposal from the research backend.');
 				break;
 			}
-			await this.runExperiment(
-				proposal.code,
-				proposal.reasoning,
-				trainData, valData, callbacks
-			);
+			await this.runCandidate(proposal, trainData, valData, callbacks);
+			this.iteration += 1;
 		}
 
 		this.running = false;
 	}
 
-	private async runExperiment(
-		code: string,
-		reasoning: string,
+	private syncChampionFromHistory() {
+		const autoHistory = this.history.filter((record) => record.source === 'auto');
+		const accepted = [...autoHistory].sort(compareNewestFirst).find((record) => record.kept && !record.error);
+		const champion = accepted ?? [...autoHistory]
+			.sort(compareNewestFirst)
+			.find((record) => !record.error && extractResearchConfigFromCode(record.code));
+
+		if (champion) {
+			const config = extractResearchConfigFromCode(champion.code);
+			if (config) {
+				this.bestConfig = config;
+				this.bestCode = champion.code;
+				this.bestBpb = champion.valBpb;
+				this.bestResearchScore = champion.primaryScore ?? extractScoreFromReasoning(champion.reasoning);
+			}
+		} else {
+			const configFromCode = extractResearchConfigFromCode(this.bestCode);
+			this.bestConfig = configFromCode ?? BASELINE_RESEARCH_CONFIG;
+			this.bestCode = buildTrainCodeFromConfig(this.bestConfig);
+		}
+
+		this.iteration = autoHistory.filter((record) => !record.rerunOf).length;
+	}
+
+	private async runBaseline(
 		trainData: DataLoader,
 		valData: DataLoader,
 		callbacks: ResearchCallbacks
 	) {
-		callbacks.onExperimentStart?.(code, reasoning);
+		const config = normalizeResearchConfig(this.bestConfig);
+		const baseline = await this.trainAndEvaluate(
+			config,
+			'Baseline run with fixed config and benchmark evaluation.',
+			'representation',
+			'baseline',
+			[],
+			trainData,
+			valData,
+			callbacks
+		);
+		const kept = !baseline.result.error && (baseline.report?.gated ?? true);
+		await this.persistOutcome(baseline, kept, callbacks);
+		if (kept) {
+			this.bestConfig = baseline.config;
+			this.bestCode = baseline.code;
+			this.bestBpb = baseline.result.valBpb;
+			this.bestResearchScore = outcomeScore(baseline);
+		}
+	}
+
+	private async runCandidate(
+		candidate: CandidateSpec,
+		trainData: DataLoader,
+		valData: DataLoader,
+		callbacks: ResearchCallbacks
+	) {
+		const quick = await this.trainAndEvaluate(
+			candidate.config,
+			candidate.reasoning,
+			candidate.phase,
+			'quick-screen',
+			candidate.changedKeys,
+			trainData,
+			valData,
+			callbacks
+		);
+
+		if (quick.result.error || (quick.report && !quick.report.gated)) {
+			await this.persistOutcome(quick, false, callbacks);
+			return;
+		}
+
+		const full = await this.trainAndEvaluate(
+			candidate.config,
+			candidate.reasoning,
+			candidate.phase,
+			'full-benchmark',
+			candidate.changedKeys,
+			trainData,
+			valData,
+			callbacks
+		);
+
+		if (full.result.error || (full.report && !full.report.gated)) {
+			await this.persistOutcome(full, false, callbacks);
+			return;
+		}
+
+		const challengerScore = outcomeScore(full);
+		if (challengerScore <= this.bestResearchScore) {
+			await this.persistOutcome(full, false, callbacks);
+			return;
+		}
+
+		const benchmarkGroup = `confirm ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+		const confirmation = await this.trainAndEvaluate(
+			normalizeResearchConfig({ ...candidate.config, seed: candidate.config.seed + 1 }),
+			`Confirmation rerun for candidate: ${candidate.reasoning}`,
+			candidate.phase,
+			'confirmation',
+			[...candidate.changedKeys, 'seed'],
+			trainData,
+			valData,
+			callbacks
+		);
+
+		const confirmationScore = outcomeScore(confirmation);
+		const averageScore = averageFinite([challengerScore, confirmationScore]);
+		const accepted = Number.isFinite(averageScore) && averageScore > this.bestResearchScore;
+
+		const primaryRecord = await this.persistOutcome(full, accepted, callbacks, {
+			benchmarkGroup
+		});
+		await this.persistOutcome(confirmation, false, callbacks, {
+			rerunOf: primaryRecord.id,
+			benchmarkGroup
+		});
+
+		if (accepted) {
+			this.bestConfig = full.config;
+			this.bestCode = full.code;
+			this.bestBpb = full.result.valBpb;
+			this.bestResearchScore = averageScore;
+		}
+	}
+
+	private async trainAndEvaluate(
+		config: ResearchConfig,
+		reasoning: string,
+		phase: ResearchPhase,
+		stage: Outcome['stage'],
+		changedKeys: (keyof ResearchConfig)[],
+		trainData: DataLoader,
+		valData: DataLoader,
+		callbacks: ResearchCallbacks
+	): Promise<Outcome> {
+		const code = buildTrainCodeFromConfig(config);
+		const stageReasoning = `${reasoning} [${stage}]`;
+		callbacks.onExperimentStart?.(code, stageReasoning);
 
 		this.runAbort = new AbortController();
 		const lossCurve: { step: number; loss: number }[] = [];
 
-		const result = await executeTrainCode(code, trainData, valData, this.trainSeconds, {
-			signal: this.runAbort.signal,
-			onStep(m) {
-				lossCurve.push({ step: m.step, loss: m.loss });
-				callbacks.onStep?.(m);
+		const result = await executeTrainCode(
+			code,
+			trainData,
+			valData,
+			stageSeconds(stage, this.trainSeconds),
+			this.datasetContext?.trainerKey ?? DEFAULT_TRAINER_KEY,
+			{
+				signal: this.runAbort.signal,
+				onStep: (metrics) => {
+					lossCurve.push({ step: metrics.step, loss: metrics.loss });
+					callbacks.onStep?.(metrics);
+				}
 			}
-		});
+		);
 		this.runAbort = null;
 
-		const kept = result.valBpb < this.bestBpb && !result.error;
-		if (kept) {
-			this.bestBpb = result.valBpb;
-			this.bestCode = code;
-		}
+		const report = result.error
+			? null
+			: await evaluateResearchRun({
+				params: result.params,
+				forward: result.forward,
+				vocabSize: result.vocabSize,
+				seqLen: result.seqLen,
+				context: this.datasetContext ?? undefined,
+				valBpb: result.valBpb,
+				mode: stage === 'quick-screen' ? 'quick' : 'full'
+			});
 
-		const expName = petname();
-		const dbId = await insertExperiment({
-			name: expName,
-			source: 'auto',
+		return {
+			config,
 			code,
-			valBpb: result.valBpb,
-			elapsed: result.elapsed,
-			totalSteps: result.totalSteps,
+			reasoning,
+			phase,
+			stage,
+			changedKeys,
+			result,
+			lossCurve,
+			report
+		};
+	}
+
+	private async persistOutcome(
+		outcome: Outcome,
+		kept: boolean,
+		callbacks: ResearchCallbacks,
+		options: {
+			rerunOf?: number | null;
+			benchmarkGroup?: string | null;
+		} = {}
+	): Promise<ExperimentRecord> {
+		const name = petname();
+		const evalSummary: ExperimentEvalSummary | null = buildEvalSummary(
+			outcome.report,
+			outcome.stage,
+			outcome.phase
+		);
+		const reasoning = keepReasoning(
+			outcome.reasoning,
+			outcome.phase,
+			outcome.stage,
+			outcome.changedKeys,
+			outcome.report
+		);
+
+		const dbId = await insertExperiment({
+			name,
+			source: 'auto',
+			code: outcome.code,
+			datasetVersionId: this.datasetContext?.versionId ?? null,
+			datasetLabel: this.datasetContext?.label ?? null,
+			datasetSourceRef: this.datasetContext?.sourceRef ?? null,
+			trainerKey: this.datasetContext?.trainerKey ?? DEFAULT_TRAINER_KEY,
+			modelFamily: this.datasetContext?.modelFamily ?? 'byte-gpt',
+			valBpb: outcome.result.valBpb,
+			primaryScore: evalSummary?.primaryScore ?? null,
+			elapsed: outcome.result.elapsed,
+			totalSteps: outcome.result.totalSteps,
 			reasoning,
 			kept,
-			lossCurve,
-			error: result.error,
+			lossCurve: outcome.lossCurve,
+			error: outcome.result.error,
+			evalSummary,
+			rerunOf: options.rerunOf ?? null,
+			benchmarkGroup: options.benchmarkGroup ?? null
 		});
 
-		await insertLossCurve(dbId, lossCurve);
+		await insertLossCurve(dbId, outcome.lossCurve);
 
-		if (result.params && Object.keys(result.params).length > 0) {
+		for (const sample of outcome.report?.samples ?? []) {
+			await insertInference({
+				experimentId: dbId,
+				prompt: `[${outcome.stage}:${sample.label}] ${sample.prompt}`,
+				output: sample.output,
+				temperature: sample.temperature
+			});
+		}
+
+		if (
+			outcome.stage !== 'quick-screen' &&
+			outcome.result.params &&
+			Object.keys(outcome.result.params).length > 0
+		) {
 			(async () => {
 				try {
-					const weightsPath = await saveWeights(dbId, result.params);
+					const weightsPath = await saveWeights(dbId, outcome.result.params);
 					await updateWeightsPath(dbId, weightsPath);
-				} catch (e) { console.error('Failed to save weights:', e); }
+				} catch (error) {
+					console.error('Failed to save weights:', error);
+				}
 			})();
 		}
 
 		const record: ExperimentRecord = {
 			id: dbId,
-			name: expName,
+			name,
 			source: 'auto',
-			code,
-			valBpb: result.valBpb,
-			elapsed: result.elapsed,
-			totalSteps: result.totalSteps,
+			code: outcome.code,
+			datasetVersionId: this.datasetContext?.versionId ?? null,
+			datasetLabel: this.datasetContext?.label ?? null,
+			datasetSourceRef: this.datasetContext?.sourceRef ?? null,
+			trainerKey: this.datasetContext?.trainerKey ?? DEFAULT_TRAINER_KEY,
+			modelFamily: this.datasetContext?.modelFamily ?? 'byte-gpt',
+			valBpb: outcome.result.valBpb,
+			primaryScore: evalSummary?.primaryScore ?? null,
+			elapsed: outcome.result.elapsed,
+			totalSteps: outcome.result.totalSteps,
 			reasoning,
 			kept,
-			error: result.error,
-			lossCurve
+			error: outcome.result.error,
+			lossCurve: outcome.lossCurve,
+			evalSummary,
+			rerunOf: options.rerunOf ?? null,
+			benchmarkGroup: options.benchmarkGroup ?? null,
+			researchPhase: outcome.phase
 		};
 
 		this.history.push(record);
 		callbacks.onExperimentDone?.(record);
+		return record;
 	}
 
-	private async getNextCode(callbacks: ResearchCallbacks): Promise<{ code: string; reasoning: string } | null> {
-		const systemPrompt = buildSystemPrompt();
-		const userPrompt = buildUserPrompt(this.history, this.bestCode, this.bestBpb);
+	private async getNextProposal(callbacks: ResearchCallbacks): Promise<CandidateSpec | null> {
+		const phase = researchPhaseForIteration(this.iteration);
+		const systemPrompt = buildSystemPrompt(this.datasetContext ?? undefined, phase);
+		const userPrompt = buildUserPrompt(
+			this.history,
+			this.bestConfig,
+			this.bestResearchScore,
+			phase,
+			this.datasetContext ?? undefined
+		);
 
 		this.fetchAbort = new AbortController();
 		try {
@@ -155,7 +455,7 @@ export class ResearchController {
 					systemPrompt,
 					userPrompt,
 					stream: true,
-					profile: this.profile,
+					profile: this.profile
 				}),
 				signal: this.fetchAbort.signal
 			});
@@ -166,17 +466,16 @@ export class ResearchController {
 				return null;
 			}
 
-			// Parse SSE stream from Anthropic
 			const fullText = await this.consumeStream(response, callbacks);
 			if (!fullText) {
 				this.lastError = 'Empty response from the research backend';
 				return null;
 			}
 
-			return this.parseResponse(fullText);
-		} catch (e) {
+			return this.parseProposal(fullText, phase, callbacks);
+		} catch (error) {
 			if (this.stopRequested) return null;
-			this.lastError = `Fetch failed: ${e}`;
+			this.lastError = `Fetch failed: ${error}`;
 			return null;
 		} finally {
 			this.fetchAbort = null;
@@ -205,78 +504,66 @@ export class ResearchController {
 				try {
 					const event = JSON.parse(data);
 					if (event.type === 'text_delta' && event.text) {
-						const chunk = event.text;
-						fullText += chunk;
-
-						// Try to extract streaming code from the partial JSON
-						const extracted = this.extractStreamingCode(fullText);
-						if (extracted.code) {
-							callbacks.onCodeStream?.(extracted.code);
-						}
-						if (extracted.reasoning) {
-							callbacks.onReasoningStream?.(extracted.reasoning);
+						fullText += event.text;
+						const reasoning = this.extractStreamingReasoning(fullText);
+						if (reasoning) {
+							callbacks.onReasoningStream?.(reasoning);
 						}
 					}
-				} catch {}
+				} catch {
+					// Ignore malformed SSE chunks.
+				}
 			}
 		}
 
 		return fullText;
 	}
 
-	/** Try to extract code and reasoning from partial JSON as it streams in. */
-	private extractStreamingCode(partial: string): { code?: string; reasoning?: string } {
-		const result: { code?: string; reasoning?: string } = {};
+	private extractStreamingReasoning(partial: string): string | undefined {
+		const match = partial.match(/"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+		if (!match) return undefined;
 
-		// Try to find reasoning field
-		const reasoningMatch = partial.match(/"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-		if (reasoningMatch) {
-			try { result.reasoning = JSON.parse('"' + reasoningMatch[1] + '"'); } catch {}
+		try {
+			return JSON.parse(`"${match[1]}"`);
+		} catch {
+			return undefined;
 		}
-
-		// Try to find code field — it may be incomplete
-		const codeStart = partial.indexOf('"code"');
-		if (codeStart === -1) return result;
-
-		// Find the opening quote of the code value
-		const colonAfterCode = partial.indexOf(':', codeStart + 6);
-		if (colonAfterCode === -1) return result;
-
-		const quoteStart = partial.indexOf('"', colonAfterCode);
-		if (quoteStart === -1) return result;
-
-		// Extract the code value, handling escaped characters
-		// Walk through the string handling escapes
-		let code = '';
-		let i = quoteStart + 1;
-		while (i < partial.length) {
-			if (partial[i] === '\\' && i + 1 < partial.length) {
-				const next = partial[i + 1];
-				if (next === '"') { code += '"'; i += 2; }
-				else if (next === '\\') { code += '\\'; i += 2; }
-				else if (next === 'n') { code += '\n'; i += 2; }
-				else if (next === 't') { code += '\t'; i += 2; }
-				else if (next === 'r') { code += '\r'; i += 2; }
-				else { code += partial[i]; i++; }
-			} else if (partial[i] === '"') {
-				// End of string
-				break;
-			} else {
-				code += partial[i];
-				i++;
-			}
-		}
-
-		if (code.length > 0) {
-			result.code = code;
-		}
-
-		return result;
 	}
 
-	private parseResponse(text: string): { code: string; reasoning: string } | null {
-		const result = parseClaudeResponse(text);
-		if (!result) this.lastError = 'Could not parse research backend response';
-		return result;
+	private parseProposal(
+		text: string,
+		phase: ResearchPhase,
+		callbacks: ResearchCallbacks
+	): CandidateSpec | null {
+		const parsed = parseClaudeResponse(text);
+		if (!parsed) {
+			this.lastError = 'Could not parse research backend response';
+			return null;
+		}
+
+		let proposal: ResearchProposal = parsed;
+		if (!proposal.reasoning.trim()) {
+			proposal = { ...proposal, reasoning: 'Small constrained challenger.' };
+		}
+
+		try {
+			const applied = applyResearchProposal(this.bestConfig, proposal, phase);
+			const code = buildTrainCodeFromConfig(applied.config);
+			callbacks.onCodeStream?.(code);
+			return {
+				config: applied.config,
+				reasoning: proposal.reasoning.trim(),
+				phase,
+				changedKeys: applied.changedKeys
+			};
+		} catch (error) {
+			this.lastError = error instanceof Error ? error.message : String(error);
+			return null;
+		}
 	}
+}
+
+function averageFinite(values: number[]): number {
+	const finite = values.filter((value) => Number.isFinite(value));
+	return finite.length > 0 ? finite.reduce((sum, value) => sum + value, 0) / finite.length : Number.NEGATIVE_INFINITY;
 }

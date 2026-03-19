@@ -1,17 +1,19 @@
+import type { ResearchProposal } from './config';
+
 /**
- * Shared Claude response parsing logic.
+ * Shared research response parsing logic.
  */
-export function parseClaudeResponse(text: string): { code: string; reasoning: string } | null {
+export function parseClaudeResponse(text: string): ResearchProposal | null {
 	try {
 		const parsed = JSON.parse(text);
-		if (parsed.code && parsed.reasoning) return parsed;
+		if (parsed && typeof parsed.reasoning === 'string') return parsed;
 	} catch {}
 
 	const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
 	if (fenceMatch) {
 		try {
 			const parsed = JSON.parse(fenceMatch[1].trim());
-			if (parsed.code) return { code: parsed.code, reasoning: parsed.reasoning || '' };
+			if (parsed && typeof parsed.reasoning === 'string') return parsed;
 		} catch {}
 	}
 
@@ -24,7 +26,7 @@ export function parseClaudeResponse(text: string): { code: string; reasoning: st
 				else if (text[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
 			}
 			const parsed = JSON.parse(text.slice(start, end + 1));
-			if (parsed.code) return { code: parsed.code, reasoning: parsed.reasoning || '' };
+			if (parsed && typeof parsed.reasoning === 'string') return parsed;
 		}
 	} catch {}
 

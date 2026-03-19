@@ -22,13 +22,14 @@ export async function executeTrainCode(
 	trainData: DataLoader,
 	valData: DataLoader,
 	trainSeconds: number,
+	trainerKey: string | null | undefined,
 	callbacks: {
 		onStep: (m: StepMetrics) => void;
 		signal: AbortSignal;
 		timeoutMs?: number;
 	}
 ): Promise<RunResult> {
-	const prepare = getPrepareGlobals();
+	const prepare = getPrepareGlobals(trainerKey);
 
 	let lastStep = 0;
 	let lastElapsed = 0;
@@ -45,10 +46,11 @@ export async function executeTrainCode(
 		resolveResult = resolve;
 	});
 
-	const onReturn = (r: TrainResult & { valBpb?: number }) => {
+	const onReturn = (r: TrainResult & { valBpb?: number; score?: number }) => {
 		resolved = true;
+		const primaryScore = r.score ?? r.valBpb ?? Infinity;
 		resolveResult?.({
-			valBpb: r.valBpb ?? Infinity,
+			valBpb: primaryScore,
 			totalSteps: lastStep,
 			elapsed: lastElapsed,
 			params: r.params,
@@ -65,7 +67,7 @@ export async function executeTrainCode(
 		trainSeconds: number;
 		signal: AbortSignal;
 		onStep: typeof onStep;
-		onReturn: (r: TrainResult & { valBpb?: number }) => void;
+		onReturn: (r: TrainResult & { valBpb?: number; score?: number }) => void;
 	} = {
 		trainData,
 		valData,
@@ -123,7 +125,7 @@ export async function executeTrainCode(
 			elapsed: lastElapsed,
 			params: {},
 			forward: () => { throw new Error('no model'); },
-			vocabSize: 256,
+			vocabSize: prepare.VOCAB_SIZE,
 			batchSize: 8,
 			seqLen: 128,
 			error: msg,

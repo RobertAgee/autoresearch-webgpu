@@ -1,5 +1,16 @@
+import { getTrainerDefinition } from '$lib/trainers';
+import {
+	extractResearchConfigFromCode,
+	phaseFields,
+	summarizeResearchConfig,
+	type ResearchConfig,
+	type ResearchPhase
+} from './config';
+import type { ExperimentEvalSummary } from './metrics';
+
 export type ExperimentRecord = {
 	id: number;
+	projectId?: number | null;
 	name: string;
 	source: 'manual' | 'auto';
 	code: string;
@@ -13,6 +24,32 @@ export type ExperimentRecord = {
 	rerunOf?: number | null;
 	benchmarkGroup?: string | null;
 	createdAt?: string;
+	datasetVersionId?: number | null;
+	datasetLabel?: string | null;
+	datasetSourceRef?: string | null;
+	trainerKey?: string | null;
+	modelFamily?: string | null;
+	researchPhase?: string | null;
+	primaryScore?: number | null;
+	evalSummary?: ExperimentEvalSummary | null;
+};
+
+export type ResearchDatasetContext = {
+	versionId?: number | null;
+	label: string;
+	sourceRef: string;
+	recipeKey: string;
+	recipeDescription: string;
+	preprocessingSummary: string;
+	preprocessingSteps: string[];
+	researchNotes: string[];
+	samplePrompt: string;
+	trainerKey: string;
+	modelFamily: string;
+	vocabSize: number;
+	trainBytes: number;
+	validationBytes: number;
+	textFields: string[];
 };
 
 function experimentTimeValue(exp: ExperimentRecord): number {
@@ -26,7 +63,7 @@ function compareNewestFirst(a: ExperimentRecord, b: ExperimentRecord): number {
 }
 
 function compareBestFirst(a: ExperimentRecord, b: ExperimentRecord): number {
-	return a.valBpb - b.valBpb || compareNewestFirst(a, b);
+	return Number(b.kept) - Number(a.kept) || a.valBpb - b.valBpb || compareNewestFirst(a, b);
 }
 
 function formatValBpb(value: number): string {
@@ -39,6 +76,10 @@ function summarizeExperiment(exp: ExperimentRecord): string {
 	if (exp.rerunOf) {
 		msg += ` [rerun of #${exp.rerunOf}]`;
 	}
+	const config = extractResearchConfigFromCode(exp.code);
+	if (config) {
+		msg += `\n  config: ${summarizeResearchConfig(config)}`;
+	}
 	if (exp.reasoning) {
 		msg += `\n  ${exp.reasoning}`;
 	}
@@ -49,106 +90,105 @@ function summarizeExperiment(exp: ExperimentRecord): string {
 }
 
 /**
- * System prompt with jax-js API reference.
- * This is large (~3k tokens) and should be cached via Anthropic prompt caching.
+ * System prompt for constrained research proposals.
  */
-export function buildSystemPrompt(): string {
-	return `You are an autonomous ML researcher. You write training code that runs in the browser using WebGPU via jax-js.
+export function buildSystemPrompt(context: ResearchDatasetContext | undefined, phase: ResearchPhase): string {
+	const trainer = getTrainerDefinition(context?.trainerKey);
+	const datasetLabel = context?.label ?? 'the active local dataset';
+	const datasetSourceRef = context?.sourceRef ?? 'local import';
+	const trainBytes = context?.trainBytes ?? 0;
+	const validationBytes = context?.validationBytes ?? 0;
+	const textFieldSummary = context?.textFields?.length
+		? context.textFields.join(', ')
+		: 'dataset text fields';
+	const vocabSize = context?.vocabSize ?? trainer.defaultVocabSize;
+	const recipeDescription = context?.recipeDescription ?? 'Generic text packing for the active dataset.';
+	const preprocessingSummary = context?.preprocessingSummary ?? 'No recipe-specific preprocessing summary was provided.';
+	const preprocessingSteps = context?.preprocessingSteps?.length
+		? context.preprocessingSteps.map((step) => `- ${step}`).join('\n')
+		: '- No explicit preprocessing steps were provided.';
+	const trainerNotes = trainer.researchNotes.length
+		? trainer.researchNotes.map((note) => `- ${note}`).join('\n')
+		: '- No trainer-specific notes were provided.';
+	const datasetNotes = context?.researchNotes?.length
+		? context.researchNotes.map((note) => `- ${note}`).join('\n')
+		: '- No dataset-specific notes were provided.';
+	const samplePrompt = context?.samplePrompt?.trim()
+		? context.samplePrompt
+		: '(none)';
+	const allowedFields = phaseFields(phase).join(', ');
 
-Your goal: minimize validation bits-per-byte (val_bpb). Lower is better.
+	return `You are an autonomous ML researcher. You are NOT allowed to rewrite the training program.
+
+Your goal: improve usable sample quality for this dataset while still caring about ${trainer.metricLabel} (${trainer.metricKey}).
+The runtime now assembles the training code from a constrained config schema and rejects unusable symbolic music even if ${trainer.metricKey} improves.
 
 ## Environment
 - You are running on a web interface in the browser with WebGPU (Apple M-series GPU, ~8GB shared memory)
-- Byte-level tokenizer (vocab_size=256), ~1MB Shakespeare dataset
-- Training budget: ~30 seconds wall-clock time. Aim for fast training steps.
+- Trainer: ${trainer.label} (${trainer.key})
+- Objective: ${trainer.objectiveSummary}
+- ${trainer.tokenizerLabel} (vocab_size=${vocabSize})
+- Active dataset: ${datasetLabel} (${datasetSourceRef})
+- Dataset recipe: ${context?.recipeKey ?? 'unknown'} - ${recipeDescription}
+- Imported text fields: ${textFieldSummary}
+- Current local corpus size: train=${trainBytes} bytes, validation=${validationBytes} bytes
+- Multi-fidelity pipeline:
+  - quick screen: ~12 seconds training + lightweight sample checks
+  - full eval: ~30 seconds training + benchmark prompt evaluation
+  - confirmation rerun: only for provisional winners
 - Practical limit: ~300K parameters. Bigger models = fewer steps in the budget, which often hurts.
 - The sweet spot is small, fast models that get many training steps in 30 seconds.
+- Current search phase: ${phase}
+- Allowed fields this phase: ${allowedFields}
+- Maximum mutation size this phase: ${phase === 'mixed' ? '4 fields' : '3 fields'}
 
-## Your code receives these globals
+## Trainer-specific guidance
+${trainerNotes}
 
-### jax-js core (like JAX/numpy)
-- np.array(data, { dtype?, shape? }) — create array. dtype: np.float32, np.int32
-- np.zeros(shape), np.ones(shape) — constant arrays
-- np.arange(start, stop, step, { dtype }) — range (4th arg is options, NOT 3rd)
-- np.dot(a, b) — matrix multiply
-- np.concatenate([a, b], axis) — concatenate along axis
-- np.outer(a, b) — outer product
-- np.power(base, exp), np.negative(x), np.square(x), np.tanh(x)
-- np.cos(x), np.sin(x)
-- arr.mul(x), arr.add(x), arr.sub(x), arr.neg(), arr.sum(axis?)
-- arr.reshape(shape), arr.slice(...ranges) — e.g. arr.slice([], [], [], [0, half])
-- arr.shape — number array of dimensions
+## Dataset-specific guidance
+${datasetNotes}
 
-### nn (neural network ops)
-- nn.standardize(x, axis, { epsilon }) — like layer norm without affine
-- nn.relu(x), nn.gelu(x), nn.silu(x) — activations
-- nn.softmax(x, axis?), nn.logSoftmax(x, axis?)
-- nn.oneHot(indices, numClasses) — one-hot encoding
-- nn.dotProductAttention(q, k, v, { isCausal }) — scaled dot-product attention
+## Preprocessing plan
+- Summary: ${preprocessingSummary}
+${preprocessingSteps}
+- Preferred sample prefix: ${samplePrompt}
 
-### random
-- random.key(seed) — create PRNG key
-- random.split(key, num) — split key into multiple subkeys
-- random.normal(key, shape) — sample from N(0,1)
-- random.uniform(key, shape, { minval, maxval }) — uniform samples
-
-### tree & autodiff
-- tree.ref(params) — reference a param dict for autodiff (IMPORTANT: needed for valueAndGrad)
-- valueAndGrad(fn) — returns function that computes (value, gradients)
-- blockUntilReady(x) — await GPU computation
-
-### optimizer (optax-style)
-- adamw(lrFn, { weightDecay, b1, b2 }) — create AdamW optimizer. lrFn(step) returns lr
-- optimizer.init(params) — initialize optimizer state (pass tree.ref(params))
-- optimizer.update(grads, state, params) — returns [updates, newState]
-- applyUpdates(params, updates) — apply optimizer updates to params
-
-### data
-- trainData.nextBatch(batchSize, seqLen) → { input, target } (int32 arrays [B, T])
-- valData (same interface, for validation)
-
-### callbacks (you MUST call these)
-- onStep({ step, loss, elapsed }) — call every training step
-- onReturn({ params, forward, vocabSize, batchSize, seqLen, valBpb }) — call when done
-- signal.aborted — check this in your loop to support early stopping
-
-### utilities
-- lrSchedule(progress, warmupRatio, cooldownRatio) → multiplier in [0,1]
-- yieldToUI() — call periodically (await) to keep browser responsive
-- evaluate(params, forwardFn, vocabSize, valData, batchSize, seqLen) → Promise<number> (val_bpb)
-- VOCAB_SIZE — always 256
-- trainSeconds — wall-clock budget in seconds
-
-## CRITICAL: .ref ownership model
-jax-js uses reference counting. When an array is used in a computation, it is CONSUMED (freed).
-- Use arr.ref to create an extra reference when you need to use an array multiple times
-- The LAST use of an array should NOT use .ref (it consumes the original)
-- tree.ref(params) creates refs for all params in a dict
-- Example: x.ref.mul(a).add(x.mul(b)) — .ref on first use, consume on last
-
-## CRITICAL: Gather not implemented
-jax-js cannot differentiate through fancy indexing. For embeddings, use:
-  nn.oneHot(ids.reshape([-1]), VOCAB_SIZE) then np.dot(oneHot, embedMatrix)
+## Critical objective
+- For ABC datasets, valid structure, clean termination, prompt-structure fidelity, and low collapse matter more than tiny ${trainer.metricShortLabel} gains.
+- Proposals that fail basic ABC structure gates will be discarded.
+- Most proposals should be small explicit edits to the current champion, not broad jumps.
 
 ## Output format
 Respond with ONLY a JSON object:
 {
-  "reasoning": "one sentence explaining what you changed and why",
-  "code": "... your full training code as a string ..."
+  "reasoning": "one sentence explaining the hypothesis",
+  "changes": {
+    "fieldName": value
+  }
 }
 
-The code field must be valid JavaScript that can run inside an async function.
-Do NOT include import statements, markdown fences, or comments about the JSON format.
-Keep the code concise. Do not add comments unless they clarify a non-obvious change.`;
+Rules:
+- Change only allowed fields for the current phase: ${allowedFields}
+- Change at most ${phase === 'mixed' ? '4' : '3'} fields
+- Prefer 1-2 field edits unless there is a strong reason not to
+- Do not include code
+- Do not include markdown fences
+- Do not restate unchanged config values
+- If the current champion already looks good, still propose a small challenger rather than returning an empty diff`;
 }
 
 export function buildUserPrompt(
 	history: ExperimentRecord[],
-	bestCode: string,
-	bestBpb: number
+	bestConfig: ResearchConfig,
+	bestScore: number,
+	phase: ResearchPhase,
+	context?: ResearchDatasetContext
 ): string {
-	let msg = `Current best code (val_bpb = ${formatValBpb(bestBpb)}):\n`;
-	msg += '```\n' + bestCode + '\n```\n\n';
+	const trainer = getTrainerDefinition(context?.trainerKey);
+	let msg = `Current champion config (phase=${phase}):\n`;
+	msg += `${summarizeResearchConfig(bestConfig)}\n`;
+	msg += `Champion research score: ${Number.isFinite(bestScore) ? bestScore.toFixed(2) : '-Infinity'}\n`;
+	msg += `Champion ${trainer.metricKey}: ${formatValBpb(history.find((exp) => exp.kept)?.valBpb ?? Infinity)}\n\n`;
 
 	if (history.length > 0) {
 		const valid = history.filter((exp) => !exp.error && Number.isFinite(exp.valBpb));
@@ -176,6 +216,20 @@ export function buildUserPrompt(
 		msg += '\n';
 	}
 
-	msg += `\nPropose the next experiment. Respond with ONLY the JSON object.`;
+	if (context) {
+		msg += '\nDataset operating notes:\n';
+		msg += `- recipe: ${context.recipeKey}\n`;
+		msg += `- preprocessing: ${context.preprocessingSummary}\n`;
+		if (context.researchNotes.length > 0) {
+			for (const note of context.researchNotes) {
+				msg += `- note: ${note}\n`;
+			}
+		}
+		if (context.samplePrompt.trim()) {
+			msg += `- sample prefix: ${JSON.stringify(context.samplePrompt)}\n`;
+		}
+	}
+
+	msg += `\nPropose the next challenger as a constrained config delta. Respond with ONLY the JSON object.`;
 	return msg;
 }
